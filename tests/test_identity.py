@@ -3,6 +3,7 @@ import pytest
 from backend.identity import (
     IdentityMap,
     PersonEntity,
+    build_identity_skeleton,
     build_safe_identity_map,
     normalize_alias,
     suggest_identity_matches,
@@ -58,6 +59,29 @@ def test_safe_map_bootstrap_excludes_fuzzy_candidate_and_marks_self() -> None:
     assert identity_map.resolve("kakao", "전용준") == identity_map.resolve(
         "instagram", "전용준"
     )
+
+
+def test_identity_skeleton_keeps_ambiguous_aliases_as_separate_people() -> None:
+    kakao = ["이은세", "임명민", "전용준"]
+    instagram = ["이은세", "명민", "전용준", "인스타만"]
+    candidates = suggest_identity_matches(kakao, instagram, minimum_score=0.5)
+
+    identity_map = build_identity_skeleton(
+        kakao,
+        instagram,
+        candidates,
+        self_kakao_alias="이은세",
+        self_instagram_alias="이은세",
+    )
+
+    assert identity_map.resolve("kakao", "전용준") == identity_map.resolve(
+        "instagram", "전용준"
+    )
+    assert identity_map.resolve("kakao", "임명민") != identity_map.resolve(
+        "instagram", "명민"
+    )
+    assert identity_map.resolve("instagram", "인스타만") is not None
+    assert len(identity_map.people) == 5
 
 
 def test_identity_map_rejects_alias_collision() -> None:
