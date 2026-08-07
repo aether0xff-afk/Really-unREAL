@@ -9,12 +9,12 @@ Really-unREAL may observe the same real person under different aliases across Ka
 Examples:
 
 ```text
-Kakao: 이은세   Instagram: 이은세   -> safe exact match
-Kakao: 임명민   Instagram: 명민     -> review candidate only
-Kakao: 감동현   Instagram: 동현     -> review candidate only
+Kakao: same-name alias     Instagram: same-name alias     -> safe exact match
+Kakao: full display name   Instagram: shortened name      -> review candidate only
+Kakao: one person          Instagram: ambiguous nickname   -> review candidate only
 ```
 
-A reviewed mapping is stored in a local `identity.local.json`. This file is gitignored because it contains real-person identifiers.
+A reviewed mapping is stored in a local `identity.local.json`. This file is gitignored because it contains real-person identifiers. Explicit user-confirmed aliases may be merged there even when their strings are not similar.
 
 ## Stable person IDs
 
@@ -32,18 +32,26 @@ After review, every person gets an internal ID independent of platform names:
 
 Messages retain their original sender name, but fused evidence also carries `sender_person_id`.
 
-## Source-aware evidence
+## Kakao-primary source policy
 
-`backend.fusion.collect_person_evidence()` does not flatten all observations into one bag. It preserves the context in which each utterance was observed:
+KakaoTalk is the primary source for reconstructing persona and temporal behavior. Instagram is supplemental evidence: it fills gaps, provides extra direct-message examples, and contributes cross-platform/self-presentation context, but it should not override a stable pattern repeatedly observed in KakaoTalk.
+
+The current default relevance weights are:
 
 ```text
-kakao_direct       weight 1.00
-instagram_direct   weight 1.00
-instagram_group    weight 0.45
-kakao_group        weight 0.35
+kakao_direct       weight 1.00   primary behavioral evidence
+instagram_direct   weight 0.55   supplemental direct evidence
+kakao_group        weight 0.40   supporting style/context
+instagram_group    weight 0.20   weak supporting context
 ```
 
-These are default relevance weights, not probabilities and not relationship scores. They express how directly a sample reflects the target person's behavior in a one-to-one interaction.
+These are starting relevance weights, not probabilities and not relationship scores. They must be validated or tuned by Historical Replay. If a person has little or no Kakao data, Instagram can still provide useful evidence, but the model must retain the fact that the evidence came from a supplemental source.
+
+Posts, stories, comments, likes, saves, and follows are kept outside the core conversational-behavior weight hierarchy. They may provide context or weak interest signals, but must not be converted into claims about hidden feelings or relationship status.
+
+## Source-aware evidence
+
+`backend.fusion.collect_person_evidence()` does not flatten all observations into one bag. Every utterance keeps its platform, conversation ID, direct/group context, and evidence weight.
 
 The full surrounding conversation is kept for retrieval, but only messages explicitly resolved to the target person become persona evidence.
 
@@ -61,7 +69,7 @@ python -m backend.identity_audit \
   ./data/raw/instagram_export.zip
 ```
 
-Copy `examples/identity.example.json` to `identity.local.json`, then approve aliases manually.
+Copy `examples/identity.example.json` to `identity.local.json`, then approve aliases manually. Real names and account-to-person mappings remain local and are never committed.
 
 Audit evidence for one mapped person:
 
