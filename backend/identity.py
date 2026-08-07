@@ -4,7 +4,7 @@ import hashlib
 import json
 import re
 import unicodedata
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Iterable
@@ -14,13 +14,7 @@ _ALIAS_PUNCT = re.compile(r"[^0-9a-zA-Z가-힣]+")
 
 
 def normalize_alias(value: str) -> str:
-    """Normalize a display name/handle for conservative identity comparison.
-
-    This deliberately does not transliterate Korean names or automatically infer
-    that two fuzzy aliases are the same person. It only removes presentation
-    differences that are safe to ignore: Unicode normalization, case, leading
-    ``@``, whitespace, and punctuation.
-    """
+    """Normalize a display name/handle for conservative identity comparison."""
 
     value = unicodedata.normalize("NFC", value).strip().lower()
     if value.startswith("@"):
@@ -48,12 +42,7 @@ class PersonEntity:
 
 
 class IdentityMap:
-    """Explicit mapping from platform aliases to stable local person IDs.
-
-    The map is intentionally local configuration. Fuzzy candidate generation is
-    separate from resolution so a plausible-looking match never silently mixes
-    two real people into one persona.
-    """
+    """Explicit mapping from platform aliases to stable local person IDs."""
 
     def __init__(self, people: Iterable[PersonEntity] = ()) -> None:
         self.people = tuple(people)
@@ -150,12 +139,7 @@ def suggest_identity_matches(
     *,
     minimum_score: float = 0.55,
 ) -> list[IdentityCandidate]:
-    """Rank cross-platform identity candidates without applying them.
-
-    Exact normalized display-name matches are marked ``safe_auto_match``.
-    Everything else is only a suggestion for human review, even when the fuzzy
-    score is high.
-    """
+    """Rank cross-platform candidates without applying fuzzy matches."""
 
     candidates: list[IdentityCandidate] = []
     for kakao in sorted(set(kakao_aliases)):
@@ -208,10 +192,94 @@ def suggest_identity_matches(
     return candidates
 
 
-def _stable_person_id(kakao_alias: str, instagram_alias: str) -> str:
-    key = f"{normalize_alias(kakao_alias)}|{normalize_alias(instagram_alias)}"
+def _stable_person_id(*parts: str) -> str:
+    key = "|".join(parts)
     digest = hashlib.sha256(key.encode("utf-8")).hexdigest()[:10]
     return f"person-{digest}"
+
+
+def build_identity_skeleton(
+    kakao_aliases: Iterable[str],
+    instagram_aliases: Iterable[str],
+    candidates: Iterable[IdentityCandidate],
+    *,
+    self_kakao_alias: str | None = None,
+    self_instagram_alias: str | None = None,
+) -> IdentityMap:
+    """Build a lossless local map using only safe merges.
+
+    Exact cross-platform matches are merged. Every unmatched alias still gets a
+    standalone person entity, so no data disappears. Fuzzy review candidates
+    remain separate until the user explicitly edits/merges the local map.
+
+    When both self aliases are supplied they are explicitly trusted and merged
+    into the stable ``self`` entity even if their display strings differ.
+    """
+
+    kakao = {alias for alias in kakao_aliases if normalize_alias(alias)}
+    instagram = {alias for alias in instagram_aliases if normalize_alias(alias)}
+    consumed_kakao: set[str] = set()
+    consumed_instagram: set[str] = set()
+    people: list[PersonEntity] = []
+
+    self_k = normalize_alias(self_kakao_alias or "")
+    self_i = normalize_alias(self_instagram_alias or "")
+    if bool(self_k) != bool(self_i):
+        raise ValueError("both self Kakao and Instagram aliases are required")
+    if self_k and self_i:
+        kakao_self = next((alias for alias in kakao if normalize_alias(alias) == self_k), None)
+        instagram_self = next(
+            (alias for alias in instagram if normalize_alias(alias) == self_i), None
+        )
+        if kakao_self is None or instagram_self is None:
+            raise ValueError("provided self aliases were not found in both exports")
+        people.append(
+            PersonEntity(
+                person_id="self",
+                aliases={"kakao": (kakao_self,), "instagram": (instagram_self,)},
+                is_self=True,
+            )
+        )
+        consumed_kakao.add(kakao_self)
+        consumed_instagram.add(instagram_self)
+
+    for candidate in candidates:
+        if not candidate.safe_auto_match:
+            continue
+        if candidate.kakao_alias in consumed_kakao or candidate.instagram_alias in consumed_instagram:
+            continue
+        people.append(
+            PersonEntity(
+                person_id=_stable_person_id(
+                    "pair",
+                    normalize_alias(candidate.kakao_alias),
+                    normalize_alias(candidate.instagram_alias),
+                ),
+                aliases={
+                    "kakao": (candidate.kakao_alias,),
+                    "instagram": (candidate.instagram_alias,),
+                },
+            )
+        )
+        consumed_kakao.add(candidate.kakao_alias)
+        consumed_instagram.add(candidate.instagram_alias)
+
+    for alias in sorted(kakao - consumed_kakao):
+        people.append(
+            PersonEntity(
+                person_id=_stable_person_id("kakao", normalize_alias(alias)),
+                aliases={"kakao": (alias,)},
+            )
+        )
+    for alias in sorted(instagram - consumed_instagram):
+        people.append(
+            PersonEntity(
+                person_id=_stable_person_id("instagram", normalize_alias(alias)),
+                aliases={"instagram": (alias,)},
+            )
+        )
+
+    return IdentityMap(people)
 
 
 def build_safe_identity_map(
@@ -220,46 +288,19 @@ def build_safe_identity_map(
     self_kakao_alias: str | None = None,
     self_instagram_alias: str | None = None,
 ) -> IdentityMap:
-    """Create a map from exact safe matches only.
+    """Backward-compatible exact-pair-only map builder.
 
-    Ambiguous/fuzzy candidates are deliberately ignored. ``self`` is assigned
-    only when both provided self aliases identify the same exact candidate.
+    Prefer ``build_identity_skeleton`` for real imports because it preserves
+    unmatched platform-only people instead of omitting them.
     """
 
-    self_kakao = normalize_alias(self_kakao_alias or "")
-    self_instagram = normalize_alias(self_instagram_alias or "")
-    people: list[PersonEntity] = []
-    seen_pairs: set[tuple[str, str]] = set()
-
-    for candidate in candidates:
-        if not candidate.safe_auto_match:
-            continue
-        pair = (
-            normalize_alias(candidate.kakao_alias),
-            normalize_alias(candidate.instagram_alias),
-        )
-        if pair in seen_pairs:
-            continue
-        seen_pairs.add(pair)
-
-        is_self = bool(
-            self_kakao
-            and self_instagram
-            and pair[0] == self_kakao
-            and pair[1] == self_instagram
-        )
-        person_id = "self" if is_self else _stable_person_id(
-            candidate.kakao_alias, candidate.instagram_alias
-        )
-        people.append(
-            PersonEntity(
-                person_id=person_id,
-                aliases={
-                    "kakao": (candidate.kakao_alias,),
-                    "instagram": (candidate.instagram_alias,),
-                },
-                is_self=is_self,
-            )
-        )
-
-    return IdentityMap(people)
+    safe = [candidate for candidate in candidates if candidate.safe_auto_match]
+    kakao_aliases = [candidate.kakao_alias for candidate in safe]
+    instagram_aliases = [candidate.instagram_alias for candidate in safe]
+    return build_identity_skeleton(
+        kakao_aliases,
+        instagram_aliases,
+        safe,
+        self_kakao_alias=self_kakao_alias,
+        self_instagram_alias=self_instagram_alias,
+    )
