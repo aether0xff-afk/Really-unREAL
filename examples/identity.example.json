@@ -1,0 +1,19 @@
+{
+  "people": [
+    {
+      "person_id": "self",
+      "is_self": true,
+      "aliases": {
+        "kakao": ["내 카카오 이름"],
+        "instagram": ["내 인스타 표시 이름", "my_handle"]
+      }
+    },
+    {
+      "person_id": "person-001",
+      "aliases": {
+        "kakao": ["상대 카카오 이름"],
+        "instagram": ["상대 인스타 표시 이름", "their_handle"]
+      }
+    }
+  ]
+}
