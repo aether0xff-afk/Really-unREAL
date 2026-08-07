@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import unicodedata
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Iterable
@@ -91,6 +92,27 @@ class IdentityMap:
             raise ValueError("identity map contains more than one self person")
         return self_ids[0] if self_ids else None
 
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "people": [
+                {
+                    "person_id": person.person_id,
+                    "is_self": person.is_self,
+                    "aliases": {
+                        platform: list(aliases)
+                        for platform, aliases in person.aliases.items()
+                    },
+                }
+                for person in self.people
+            ]
+        }
+
+    def to_json(self, path: str | Path) -> None:
+        Path(path).write_text(
+            json.dumps(self.to_dict(), ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+
     @classmethod
     def from_dict(cls, data: dict[str, object]) -> "IdentityMap":
         raw_people = data.get("people", [])
@@ -152,7 +174,11 @@ def suggest_identity_matches(
                 safe = True
             else:
                 ratio = SequenceMatcher(None, nk, ni).ratio()
-                containment = min(len(nk), len(ni)) / max(len(nk), len(ni)) if (nk in ni or ni in nk) else 0.0
+                containment = (
+                    min(len(nk), len(ni)) / max(len(nk), len(ni))
+                    if (nk in ni or ni in nk)
+                    else 0.0
+                )
                 score = max(ratio, containment * 0.9)
                 if ratio >= 0.75:
                     reasons.append("display names are textually similar")
@@ -180,3 +206,60 @@ def suggest_identity_matches(
         )
     )
     return candidates
+
+
+def _stable_person_id(kakao_alias: str, instagram_alias: str) -> str:
+    key = f"{normalize_alias(kakao_alias)}|{normalize_alias(instagram_alias)}"
+    digest = hashlib.sha256(key.encode("utf-8")).hexdigest()[:10]
+    return f"person-{digest}"
+
+
+def build_safe_identity_map(
+    candidates: Iterable[IdentityCandidate],
+    *,
+    self_kakao_alias: str | None = None,
+    self_instagram_alias: str | None = None,
+) -> IdentityMap:
+    """Create a map from exact safe matches only.
+
+    Ambiguous/fuzzy candidates are deliberately ignored. ``self`` is assigned
+    only when both provided self aliases identify the same exact candidate.
+    """
+
+    self_kakao = normalize_alias(self_kakao_alias or "")
+    self_instagram = normalize_alias(self_instagram_alias or "")
+    people: list[PersonEntity] = []
+    seen_pairs: set[tuple[str, str]] = set()
+
+    for candidate in candidates:
+        if not candidate.safe_auto_match:
+            continue
+        pair = (
+            normalize_alias(candidate.kakao_alias),
+            normalize_alias(candidate.instagram_alias),
+        )
+        if pair in seen_pairs:
+            continue
+        seen_pairs.add(pair)
+
+        is_self = bool(
+            self_kakao
+            and self_instagram
+            and pair[0] == self_kakao
+            and pair[1] == self_instagram
+        )
+        person_id = "self" if is_self else _stable_person_id(
+            candidate.kakao_alias, candidate.instagram_alias
+        )
+        people.append(
+            PersonEntity(
+                person_id=person_id,
+                aliases={
+                    "kakao": (candidate.kakao_alias,),
+                    "instagram": (candidate.instagram_alias,),
+                },
+                is_self=is_self,
+            )
+        )
+
+    return IdentityMap(people)
