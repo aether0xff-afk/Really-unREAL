@@ -15,6 +15,7 @@ The project does **not** claim to reproduce a real person's hidden thoughts or f
 - **No mind-reading scores.** Model observable signals such as reply delay, initiation rate, topic continuation, and message style rather than fictional affection percentages.
 - **Local-first.** Private conversations stay on the user's device by default. `data/` and private identity mappings are gitignored.
 - **Source-aware.** KakaoTalk, Instagram DMs, and social activity remain distinguishable so one context does not silently overwrite another.
+- **Kakao-primary.** KakaoTalk is the primary source for persona and temporal behavior. Instagram is supplemental evidence used to fill gaps and add cross-platform context, not to override stable Kakao-derived behavior.
 - **Conservative identity resolution.** Fuzzy name similarity may suggest a match, but never silently merges two real people.
 
 ## Phase 1 / 1.5 — implemented scaffold
@@ -67,18 +68,20 @@ python -m pytest
 
 ## Evidence hierarchy
 
-For a simulated relationship, not all observations have equal behavioral relevance:
+For a simulated relationship, not all observations have equal behavioral relevance. The default ordering is deliberately Kakao-first:
 
 ```text
-Kakao 1:1 with the user           1.00
-Instagram DM with the user        1.00
-Instagram group conversation      0.45
-Kakao group conversation          0.35
-posts / stories / comments        contextual evidence
+Kakao 1:1 with the user           1.00   primary
+Instagram DM with the user        0.55   supplemental
+Kakao group conversation          0.40   supporting style/context
+Instagram group conversation      0.20   weak supporting context
+posts / stories / comments        contextual evidence only
 likes / saves / follows           weak preference signals only
 ```
 
-These weights are evidence-relevance annotations, not probabilities and not relationship scores. The system should never turn follows, likes, or engagement into claims about hidden feelings toward a person.
+These are starting relevance weights, not calibrated probabilities and not relationship scores. Historical Replay is responsible for validating or tuning them. Instagram should help when Kakao evidence is sparse, but should not outweigh a stable behavior pattern observed repeatedly in KakaoTalk.
+
+The system should never turn follows, likes, or engagement into claims about hidden feelings toward a person.
 
 ## Architecture
 
