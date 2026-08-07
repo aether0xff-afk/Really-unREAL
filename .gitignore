@@ -10,6 +10,11 @@ venv/
 data/
 !data/.gitkeep
 
+# Cross-platform identity mappings contain real-person identifiers and stay local.
+identity.local.json
+*.identity.local.json
+config/private/
+
 # Local generated artifacts
 artifacts/
 *.sqlite3
