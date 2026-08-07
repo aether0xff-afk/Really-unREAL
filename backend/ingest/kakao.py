@@ -10,6 +10,10 @@ _DATE_SEPARATOR = re.compile(
     r"^-+\s*(?P<year>\d{4})년\s*(?P<month>\d{1,2})월\s*(?P<day>\d{1,2})일.*?-+$"
 )
 
+_PLAIN_DATE_HEADER = re.compile(
+    r"^(?P<year>\d{4})년\s*(?P<month>\d{1,2})월\s*(?P<day>\d{1,2})일(?:\s+.+)?$"
+)
+
 _BRACKET_MESSAGE = re.compile(
     r"^\[(?P<sender>.+?)\]\s*\[(?P<ampm>오전|오후)\s*(?P<hour>\d{1,2}):(?P<minute>\d{2})\]\s?(?P<text>.*)$"
 )
@@ -18,6 +22,16 @@ _INLINE_MESSAGE = re.compile(
     r"^(?P<year>\d{4})년\s*(?P<month>\d{1,2})월\s*(?P<day>\d{1,2})일\s*"
     r"(?P<ampm>오전|오후)\s*(?P<hour>\d{1,2}):(?P<minute>\d{2}),\s*"
     r"(?P<sender>.+?)\s*:\s*(?P<text>.*)$"
+)
+
+_DOTTED_MESSAGE = re.compile(
+    r"^(?P<year>\d{4})\.\s*(?P<month>\d{1,2})\.\s*(?P<day>\d{1,2})\.\s*"
+    r"(?P<ampm>오전|오후)\s*(?P<hour>\d{1,2}):(?P<minute>\d{2}),\s*"
+    r"(?P<sender>.+?)\s*:\s*(?P<text>.*)$"
+)
+
+_SYSTEM_EVENT = re.compile(
+    r"^\d{4}\.\s*\d{1,2}\.\s*\d{1,2}\.\s*(?:오전|오후)\s*\d{1,2}:\d{2}:\s*.+$"
 )
 
 
@@ -39,13 +53,22 @@ def _timestamp(day: date, ampm: str, hour: str, minute: str) -> datetime:
     )
 
 
+def _day_from_match(match: re.Match[str]) -> date:
+    return date(
+        int(match["year"]),
+        int(match["month"]),
+        int(match["day"]),
+    )
+
+
 def parse_kakao_text(text: str) -> list[ChatMessage]:
     """Parse common Korean KakaoTalk text-export formats.
 
-    The parser currently supports both the date-separator + bracket form and
-    the inline timestamp form. Unknown preamble lines are ignored. Lines after
-    a recognized message that do not start another record are preserved as
-    multiline message content.
+    Supported formats include mobile-style bracket exports and desktop exports
+    such as ``2026. 8. 7. 오후 9:11, 이름 : 메시지``. KakaoTalk preamble,
+    day headers, and membership/system events are not emitted as user messages.
+    Lines belonging to a multiline message are preserved, while trailing blank
+    separator lines are removed when the message is flushed.
     """
 
     messages: list[ChatMessage] = []
@@ -56,11 +79,12 @@ def parse_kakao_text(text: str) -> list[ChatMessage]:
         nonlocal pending
         if pending is None:
             return
+        message_text = "\n".join(pending["lines"]).rstrip()  # type: ignore[arg-type]
         messages.append(
             ChatMessage(
                 timestamp=pending["timestamp"],  # type: ignore[arg-type]
                 sender=pending["sender"],  # type: ignore[arg-type]
-                text="\n".join(pending["lines"]),  # type: ignore[arg-type]
+                text=message_text,
                 source=MemorySource.REAL,
             )
         )
@@ -68,21 +92,18 @@ def parse_kakao_text(text: str) -> list[ChatMessage]:
 
     for raw_line in text.splitlines():
         line = raw_line.rstrip("\r\n")
+        stripped = line.strip()
 
-        date_match = _DATE_SEPARATOR.match(line.strip())
+        date_match = _DATE_SEPARATOR.match(stripped) or _PLAIN_DATE_HEADER.match(stripped)
         if date_match:
             flush()
-            current_date = date(
-                int(date_match["year"]),
-                int(date_match["month"]),
-                int(date_match["day"]),
-            )
+            current_date = _day_from_match(date_match)
             continue
 
-        inline = _INLINE_MESSAGE.match(line)
+        inline = _INLINE_MESSAGE.match(line) or _DOTTED_MESSAGE.match(line)
         if inline:
             flush()
-            day = date(int(inline["year"]), int(inline["month"]), int(inline["day"]))
+            day = _day_from_match(inline)
             pending = {
                 "timestamp": _timestamp(day, inline["ampm"], inline["hour"], inline["minute"]),
                 "sender": inline["sender"].strip(),
@@ -104,6 +125,13 @@ def parse_kakao_text(text: str) -> list[ChatMessage]:
                 "sender": bracket["sender"].strip(),
                 "lines": [bracket["text"]],
             }
+            continue
+
+        if _SYSTEM_EVENT.match(line):
+            flush()
+            continue
+
+        if stripped.startswith("Talk_") or stripped.startswith("저장한 날짜"):
             continue
 
         if pending is not None:
