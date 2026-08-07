@@ -13,19 +13,21 @@ The project does **not** claim to reproduce a real person's hidden thoughts or f
 - **Behavior before prose.** A temporal/action model decides whether to wait, reply, or initiate before an LLM writes a message.
 - **REAL and SIMULATION memories never mix.** Every stored event carries an explicit source.
 - **No mind-reading scores.** Model observable signals such as reply delay, initiation rate, topic continuation, and message style rather than fictional affection percentages.
-- **Local-first.** Private conversations stay on the user's device by default. `data/` is gitignored.
-- **Source-aware.** KakaoTalk, Instagram DMs, and public/social activity are kept distinguishable so evidence from one context does not silently overwrite another.
+- **Local-first.** Private conversations stay on the user's device by default. `data/` and private identity mappings are gitignored.
+- **Source-aware.** KakaoTalk, Instagram DMs, and social activity remain distinguishable so one context does not silently overwrite another.
+- **Conservative identity resolution.** Fuzzy name similarity may suggest a match, but never silently merges two real people.
 
-## Phase 1 — implemented scaffold
+## Phase 1 / 1.5 — implemented scaffold
 
-Phase 1 turns exported messenger/social data into measurable profiles:
+The current pipeline can:
 
 1. Parse KakaoTalk text exports and ZIP bundles.
 2. Parse Meta/Instagram information-download ZIPs, including DMs and activity counts.
 3. Normalize messages into a stable schema with source metadata.
-4. Extract language/style statistics.
-5. Extract temporal behavior such as active hours, reply-delay distributions, and initiation patterns.
-6. Expose local audit/inspection tools without committing private source data.
+4. Extract language/style and temporal statistics.
+5. Suggest cross-platform identity candidates without auto-merging ambiguous names.
+6. Fuse approved aliases into stable local person IDs while preserving source/context relevance.
+7. Expose local audit tools without committing private source data.
 
 KakaoTalk text analysis:
 
@@ -39,6 +41,24 @@ KakaoTalk archive audit:
 python -m backend.audit ./data/raw/kakao_bundle.zip
 ```
 
+Cross-platform identity candidates:
+
+```bash
+python -m backend.identity_audit \
+  ./data/raw/kakao_bundle.zip \
+  ./data/raw/instagram_export.zip
+```
+
+Then copy `examples/identity.example.json` to the gitignored `identity.local.json`, review aliases, and inspect one person's fused evidence:
+
+```bash
+python -m backend.fusion_audit \
+  ./data/raw/kakao_bundle.zip \
+  ./data/raw/instagram_export.zip \
+  ./identity.local.json \
+  person-001
+```
+
 Run tests with:
 
 ```bash
@@ -47,18 +67,18 @@ python -m pytest
 
 ## Evidence hierarchy
 
-For a simulated relationship, not all observations should have equal weight:
+For a simulated relationship, not all observations have equal behavioral relevance:
 
 ```text
-1:1 conversation with the user   highest behavioral relevance
-small-group conversation          supporting evidence
-large-group conversation          general style/context only
-Instagram DM                      direct cross-platform evidence
-posts / stories / comments        self-presentation and interests
+Kakao 1:1 with the user           1.00
+Instagram DM with the user        1.00
+Instagram group conversation      0.45
+Kakao group conversation          0.35
+posts / stories / comments        contextual evidence
 likes / saves / follows           weak preference signals only
 ```
 
-The system should never turn follows, likes, or engagement into claims about hidden feelings toward a person.
+These weights are evidence-relevance annotations, not probabilities and not relationship scores. The system should never turn follows, likes, or engagement into claims about hidden feelings toward a person.
 
 ## Architecture
 
@@ -66,7 +86,14 @@ The system should never turn follows, likes, or engagement into claims about hid
 Kakao / Instagram / other records
               |
               v
-        source-aware ingest  ---> immutable REAL memory
+        source-aware ingest
+              |
+              v
+      identity resolution
+   (explicit local person IDs)
+              |
+              v
+        evidence fusion  ---> immutable REAL memory
               |
               +------> language profile
               |
@@ -96,4 +123,4 @@ The temporal/action layer sits **above** the language model. The model should no
 - **Phase 3:** shadow simulation against a past time interval
 - **Phase 4:** live real-time simulation with spontaneous initiation and long-term memory
 
-See `docs/` for the detailed design and evaluation plan.
+See `docs/IDENTITY_AND_FUSION.md` and the other documents in `docs/` for the detailed design and evaluation plan.
