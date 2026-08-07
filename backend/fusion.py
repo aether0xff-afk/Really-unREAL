@@ -20,10 +20,19 @@ class EvidenceContext(StrEnum):
 
 @dataclass(frozen=True, slots=True)
 class EvidenceWeights:
+    """Default evidence priorities for persona reconstruction.
+
+    KakaoTalk is the primary behavioral record. Instagram is supplemental: it
+    can fill gaps and add cross-platform context, but should not override a
+    stable Kakao-derived pattern merely because the Instagram export contains
+    additional messages. These are starting weights, not claims of calibrated
+    statistical reliability; Historical Replay will later tune/validate them.
+    """
+
     kakao_direct: float = 1.0
-    instagram_direct: float = 1.0
-    kakao_group: float = 0.35
-    instagram_group: float = 0.45
+    kakao_group: float = 0.40
+    instagram_direct: float = 0.55
+    instagram_group: float = 0.20
 
     def for_context(self, context: EvidenceContext) -> float:
         return {
