@@ -14,19 +14,29 @@ The project does **not** claim to reproduce a real person's hidden thoughts or f
 - **REAL and SIMULATION memories never mix.** Every stored event carries an explicit source.
 - **No mind-reading scores.** Model observable signals such as reply delay, initiation rate, topic continuation, and message style rather than fictional affection percentages.
 - **Local-first.** Private conversations stay on the user's device by default. `data/` is gitignored.
+- **Source-aware.** KakaoTalk, Instagram DMs, and public/social activity are kept distinguishable so evidence from one context does not silently overwrite another.
 
 ## Phase 1 — implemented scaffold
 
-Phase 1 turns an exported KakaoTalk text file into measurable profiles:
+Phase 1 turns exported messenger/social data into measurable profiles:
 
-1. Parse sender, timestamp, and message text.
-2. Normalize messages into a stable schema.
-3. Extract language/style statistics.
-4. Extract temporal behavior such as active hours, reply-delay distributions, and initiation patterns.
-5. Expose a small CLI for inspection.
+1. Parse KakaoTalk text exports and ZIP bundles.
+2. Parse Meta/Instagram information-download ZIPs, including DMs and activity counts.
+3. Normalize messages into a stable schema with source metadata.
+4. Extract language/style statistics.
+5. Extract temporal behavior such as active hours, reply-delay distributions, and initiation patterns.
+6. Expose local audit/inspection tools without committing private source data.
+
+KakaoTalk text analysis:
 
 ```bash
 python -m backend.cli ./data/raw/chat.txt --target "상대방 이름"
+```
+
+KakaoTalk archive audit:
+
+```bash
+python -m backend.audit ./data/raw/kakao_bundle.zip
 ```
 
 Run tests with:
@@ -35,28 +45,45 @@ Run tests with:
 python -m pytest
 ```
 
+## Evidence hierarchy
+
+For a simulated relationship, not all observations should have equal weight:
+
+```text
+1:1 conversation with the user   highest behavioral relevance
+small-group conversation          supporting evidence
+large-group conversation          general style/context only
+Instagram DM                      direct cross-platform evidence
+posts / stories / comments        self-presentation and interests
+likes / saves / follows           weak preference signals only
+```
+
+The system should never turn follows, likes, or engagement into claims about hidden feelings toward a person.
+
 ## Architecture
 
 ```text
-real message history
-        |
-        v
-     ingest  ---> immutable REAL memory
-        |
-        +------> language profile
-        |
-        +------> temporal profile
-                        |
-real clock ------------+----> action policy: WAIT / REPLY / INITIATE
-                                     |
-                                     v
-                              memory retrieval
-                                     |
-                                     v
-                              message generator
-                                     |
-                                     v
-                            SIMULATION memory
+Kakao / Instagram / other records
+              |
+              v
+        source-aware ingest  ---> immutable REAL memory
+              |
+              +------> language profile
+              |
+              +------> temporal profile
+              |
+              +------> contextual / interest evidence
+                              |
+real clock ------------------+----> action policy: WAIT / REPLY / INITIATE
+                                           |
+                                           v
+                                    memory retrieval
+                                           |
+                                           v
+                                    message generator
+                                           |
+                                           v
+                                  SIMULATION memory
 ```
 
 The temporal/action layer sits **above** the language model. The model should not generate a message merely because the application is running.
@@ -64,6 +91,7 @@ The temporal/action layer sits **above** the language model. The model should no
 ## Roadmap
 
 - **Phase 1:** parsing + observable profiles
+- **Phase 1.5:** source fusion and per-person identity resolution
 - **Phase 2:** historical replay (hide the real continuation and predict action/timing)
 - **Phase 3:** shadow simulation against a past time interval
 - **Phase 4:** live real-time simulation with spontaneous initiation and long-term memory
