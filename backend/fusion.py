@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 from enum import StrEnum
 from typing import Iterable
 
@@ -41,10 +42,6 @@ class EvidenceMessage:
     context: EvidenceContext
     sender_person_id: str | None
     evidence_weight: float
-
-    @property
-    def is_target(self) -> bool:
-        return self.sender_person_id is not None
 
 
 @dataclass(frozen=True, slots=True)
@@ -87,10 +84,7 @@ def _resolved_participants(
     }
 
 
-def _context(
-    platform: str,
-    participant_count: int,
-) -> EvidenceContext:
+def _context(platform: str, participant_count: int) -> EvidenceContext:
     if platform == "kakao":
         return (
             EvidenceContext.KAKAO_DIRECT
@@ -191,9 +185,11 @@ def collect_person_evidence(
         )
 
     conversations.sort(
-        key=lambda conversation: conversation.messages[0].message.timestamp
-        if conversation.messages
-        else None
+        key=lambda conversation: (
+            conversation.messages[0].message.timestamp
+            if conversation.messages
+            else datetime.max
+        )
     )
     return PersonEvidence(person_id=person_id, conversations=tuple(conversations))
 
