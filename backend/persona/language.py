@@ -5,7 +5,7 @@ import statistics
 from collections import Counter
 from dataclasses import asdict, dataclass
 
-from backend.models import ChatMessage
+from backend.models import ChatMessage, MessageType
 
 _TOKEN_RE = re.compile(r"[0-9A-Za-z가-힣ㅋㅎㅠㅜ]+")
 _LAUGH_RE = re.compile(r"ㅋ{2,}|ㅎ{2,}")
@@ -33,9 +33,15 @@ class LanguageProfile:
 def build_language_profile(
     messages: list[ChatMessage], sender: str, *, top_k: int = 12
 ) -> LanguageProfile:
-    own = [message for message in messages if message.sender == sender]
+    own = [
+        message
+        for message in messages
+        if message.sender == sender
+        and message.message_type == MessageType.TEXT
+        and message.text.strip()
+    ]
     if not own:
-        raise ValueError(f"no messages found for sender {sender!r}")
+        raise ValueError(f"no text messages found for sender {sender!r}")
 
     lengths = [len(message.text) for message in own]
     tokens = Counter(
