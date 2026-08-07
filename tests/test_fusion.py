@@ -77,7 +77,8 @@ def test_collects_direct_and_group_evidence_without_flattening_context() -> None
     assert [message.text for message in target_messages] == ["왜", "ㅎㅇ", "ㅋㅋ"]
     assert all(message.sender == "target" for message in target_messages)
     assert target_messages[0].metadata["evidence_weight"] == 1.0
-    assert target_messages[1].metadata["evidence_weight"] == 0.35
+    assert target_messages[1].metadata["evidence_weight"] == 0.40
+    assert target_messages[2].metadata["evidence_weight"] == 0.55
     assert target_messages[2].metadata["platform"] == "instagram"
 
 
