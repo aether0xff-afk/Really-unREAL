@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+.env
+.DS_Store
+
+# Private conversation data must never be committed.
+data/
+!data/.gitkeep
+
+# Local generated artifacts
+artifacts/
+*.sqlite3
+*.db
