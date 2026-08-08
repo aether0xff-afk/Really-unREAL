@@ -43,9 +43,9 @@ class SQLiteSimulationStore:
     """Durable local state for live/shadow simulation.
 
     `due_at` represents observable simulated behavior. `next_attempt_at` is only
-    provider-delivery bookkeeping. This separation prevents an NVIDIA outage from
-    changing when the simulated person decided to reply or from exposing later
-    conversation context to a retry.
+    provider-delivery bookkeeping. Read receipts are also simulation state: they
+    describe what the model inferred happened inside the simulation and never
+    claim to be real KakaoTalk read receipts.
     """
 
     def __init__(self, path: str | Path) -> None:
@@ -329,6 +329,98 @@ class SQLiteSimulationStore:
                 "message_type,metadata_json) VALUES(?,?,?,?,?,?,?,?)",
                 rows,
             )
+
+    def mark_messages_read(
+        self,
+        *,
+        twin_person_id: str,
+        platform: str,
+        conversation_id: str,
+        sender_person_id: str,
+        read_at: datetime,
+        sent_before_or_at: datetime | None = None,
+    ) -> int:
+        """Mark unread SIMULATION messages as read at a modeled time.
+
+        Read state is stored inside metadata_json to avoid changing the durable
+        message schema. Existing metadata is preserved. The method is idempotent:
+        once a message has a read_at value, retries cannot move that read time.
+        """
+
+        cutoff = sent_before_or_at or read_at
+        with self._connect() as db:
+            rows = db.execute(
+                "SELECT id,metadata_json FROM simulation_messages "
+                "WHERE twin_person_id=? AND platform=? AND conversation_id=? "
+                "AND sender_person_id=? AND timestamp<=? ORDER BY timestamp,id",
+                (
+                    twin_person_id,
+                    platform,
+                    conversation_id,
+                    sender_person_id,
+                    cutoff.isoformat(),
+                ),
+            ).fetchall()
+            updates: list[tuple[str, int]] = []
+            for row in rows:
+                metadata = json.loads(row["metadata_json"] or "{}")
+                if metadata.get("read_at"):
+                    continue
+                metadata["read_at"] = read_at.isoformat()
+                metadata["read_status"] = "READ"
+                metadata["read_receipt_source"] = "SIMULATION_INFERENCE"
+                updates.append((json.dumps(metadata, ensure_ascii=False), int(row["id"])))
+            if updates:
+                db.executemany(
+                    "UPDATE simulation_messages SET metadata_json=? WHERE id=?",
+                    updates,
+                )
+        return len(updates)
+
+    def backfill_read_receipts(
+        self,
+        *,
+        twin_person_id: str,
+        platform: str,
+        conversation_id: str,
+        user_sender_person_id: str = "self",
+    ) -> int:
+        """Infer read state for old live sessions that already contain replies."""
+
+        with self._connect() as db:
+            rows = db.execute(
+                "SELECT id,timestamp,sender_person_id,metadata_json FROM simulation_messages "
+                "WHERE twin_person_id=? AND platform=? AND conversation_id=? "
+                "ORDER BY timestamp,id",
+                (twin_person_id, platform, conversation_id),
+            ).fetchall()
+            unread_ids: list[int] = []
+            updates: list[tuple[str, int]] = []
+            metadata_by_id: dict[int, dict[str, object]] = {}
+            for row in rows:
+                row_id = int(row["id"])
+                metadata = json.loads(row["metadata_json"] or "{}")
+                metadata_by_id[row_id] = metadata
+                if row["sender_person_id"] == user_sender_person_id:
+                    if not metadata.get("read_at"):
+                        unread_ids.append(row_id)
+                    continue
+                if row["sender_person_id"] != twin_person_id or not unread_ids:
+                    continue
+                read_at = datetime.fromisoformat(row["timestamp"])
+                for unread_id in unread_ids:
+                    pending = metadata_by_id[unread_id]
+                    pending["read_at"] = read_at.isoformat()
+                    pending["read_status"] = "READ"
+                    pending["read_receipt_source"] = "SIMULATION_BACKFILL"
+                    updates.append((json.dumps(pending, ensure_ascii=False), unread_id))
+                unread_ids.clear()
+            if updates:
+                db.executemany(
+                    "UPDATE simulation_messages SET metadata_json=? WHERE id=?",
+                    updates,
+                )
+        return len(updates)
 
     def simulation_messages(
         self,
