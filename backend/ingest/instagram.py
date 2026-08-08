@@ -133,6 +133,8 @@ def load_instagram_export(
                 metadata: dict[str, object] = {
                     "platform": "instagram",
                     "thread_id": filename.split("/")[-2],
+                    # Meta timestamps are exported in epoch milliseconds.
+                    "timestamp_precision_seconds": 0.001,
                 }
                 for key in ("share", "photos", "reactions"):
                     if key in raw:
