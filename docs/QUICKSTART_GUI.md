@@ -5,60 +5,52 @@ The desktop UI provides a simple first-run path without editing `identity.local.
 ## Windows portable build
 
 1. Download the latest `Really-unREAL-*-Windows-x64.zip` release asset.
-2. Extract the ZIP. It contains `Really-unREAL.exe` and this quick-start guide; no Python installation is required for the portable executable.
+2. Extract it. It contains `Really-unREAL.exe` and this quick-start guide; no Python installation is required.
 3. Run `Really-unREAL.exe`.
-4. Windows SmartScreen may warn about an unsigned community build. Check that the file came from this repository's GitHub Release before choosing to run it.
+4. Windows SmartScreen may warn about an unsigned community build. Check that the file came from this repository's GitHub Release.
 
-The app does not install a service and does not automatically send messages to KakaoTalk, Instagram, or any other platform.
+The app does not install a service and never sends messages to KakaoTalk, Instagram, or any other real platform.
 
-## 1. Export KakaoTalk data
+## 1. Export and load KakaoTalk data
 
-You can load any mixture of:
+Choose **여러 ZIP 선택**. You can select one or many individual KakaoTalk chat ZIPs, and each selected ZIP may itself be an outer bundle containing several chat exports.
 
-- individual KakaoTalk chat ZIPs containing `Talk_*.txt`; and
-- outer ZIP bundles containing several KakaoTalk per-chat ZIP exports.
+On Windows, use **Ctrl** to pick individual files or **Shift** to select a range. Exact duplicate conversations are removed so accidental duplicate selection does not double-count evidence.
 
-You no longer need to manually combine separate chat ZIPs into one outer ZIP before opening Really-unREAL.
+After loading, confirm the suggested **내 이름** and choose **대화 상대**.
 
-Attachments are ignored by the current text pipeline.
+## 2. 빠른 진단 — no LLM
 
-## 2. Load one or many ZIPs
+**빠른 진단 (LLM 없음)** does not generate a reply. It checks that the selected data can build the replay dataset and reply-timing model.
 
-Open the app and choose **여러 ZIP 선택**.
+Use it when you want to answer questions such as:
 
-The operating-system file picker supports selecting several `.zip` files at once. On Windows, use **Ctrl** to pick individual files or **Shift** to select a range. One ZIP still works exactly as before.
+- Did the Kakao exports parse correctly?
+- Is my display name / target mapping usable?
+- Is there enough history for replay and timing analysis?
+- Can the relationship-specific timing model be built?
 
-Really-unREAL loads every selected archive locally, combines the discovered conversations, and removes exact duplicate conversations so accidentally selecting the same export twice does not double-count it. Each selected ZIP may itself contain either one chat or a bundle of chats.
+No model API is called in this mode.
 
-After loading, the app suggests **내 이름** by looking for the display name that appears across many chats. This is only a convenience heuristic. **Always confirm the suggested name yourself.**
+## 3. 모델 테스트 — Historical Replay benchmark
 
-After confirming your name, choose **대화 상대**. Direct-chat targets are shown roughly in order of how much target-authored evidence is available across all selected ZIPs.
+**모델 테스트 · Local LLM** and **모델 테스트 · NVIDIA NIM** are evaluation modes, not chat modes.
 
-## 3. Start with Quick Audit
+Really-unREAL hides real historical continuations, asks the model to reproduce them using only older evidence, and then compares the generated burst with the held-out real continuation. The result panel shows a human-readable summary such as generation success count, elapsed time, writing-form similarity, message-splitting error, expression matches, and timing-range matches.
 
-Choose **빠른 Audit (LLM 없음)** and press **실행**.
+Use **결과 저장** when you want the full numeric JSON.
 
-This is the recommended first run because it needs no API key and sends no conversation context to a model. It builds the same leakage-safe Historical Replay core used by the CLI and reports aggregate counts/timing metrics only.
+### Local model
 
-The result panel intentionally does not print raw private chat messages.
-
-## 4. Optional Local LLM generation
-
-Choose **Local LLM** when an OpenAI-compatible local server is already running.
-
-Default endpoint:
+Default OpenAI-compatible endpoint:
 
 ```text
 http://127.0.0.1:1234/v1
 ```
 
-This works with local runtimes such as LM Studio when their OpenAI-compatible server is enabled. Enter the model ID exposed by that server. An API key is usually unnecessary for a loopback-only local server.
+This works with local runtimes such as LM Studio when their OpenAI-compatible server is enabled.
 
-Loopback (`127.0.0.1` / `localhost`) traffic is treated as local. A non-loopback URL requires the explicit remote-context consent checkbox.
-
-## 5. Optional NVIDIA NIM
-
-Choose **NVIDIA NIM** to use the hosted NVIDIA model adapter.
+### NVIDIA NIM
 
 Default model:
 
@@ -66,36 +58,38 @@ Default model:
 nvidia/nemotron-3-ultra-550b-a55b
 ```
 
-Hosted inference sends a cutoff-safe private conversation context to NVIDIA. Therefore:
+Hosted inference sends cutoff-safe private conversation context to NVIDIA. Paste the API key only for the current run and check the explicit remote-context consent box. The GUI does not write the API key into result files.
 
-- paste the API key only for the current run;
-- check the explicit remote-context consent box;
-- do not share screenshots containing the key.
+## 4. 대화 시작 — live SIMULATION
 
-The GUI does not write the API key to result JSON or an identity file.
+Select **Local LLM** or **NVIDIA NIM**, then press **대화 시작**.
+
+A separate messenger-like window opens for the selected person. Messages typed there are simulation input only; they are not sent to a real service.
+
+The live mode is intentionally not an instant chatbot:
+
+1. You type a message.
+2. Really-unREAL records it as `SIMULATION`.
+3. The learned relationship timing model schedules a `REPLY` time.
+4. The chat window shows a countdown such as `답장 예정 · 약 28초 후`.
+5. Only when the scheduled time arrives does the language model generate the reply.
+6. After a reply, an optional future `INITIATE` event may be scheduled from historical behavior.
+
+Pending events and simulated messages are persisted in a local SQLite database, so closing and reopening the app does not deliberately collapse elapsed time. **새 대화** clears only SIMULATION state; imported real evidence is never deleted by that button.
 
 ## Privacy boundaries
 
-The GUI keeps the v1 core rules:
-
 - raw archives stay on the local machine;
-- generated results are `SIMULATION`, never promoted to real history;
-- raw historical responses are not exposed as RAG examples by default;
+- imported evidence remains `REAL`;
+- user-entered live messages and generated live messages are `SIMULATION`;
+- simulation output is never promoted into asserted real history;
 - hosted/private-context routes require explicit consent;
 - no real messaging-platform sending API is called;
-- the results pane is aggregate-only by default.
+- historical raw message text is not printed in benchmark results by default.
 
 ## Advanced CLI
 
-The GUI is deliberately a small front door, not a replacement for research workflows. Use the existing CLI for:
-
-- Instagram/Kakao cross-platform identity fusion;
-- SELF twin experiments;
-- dense retrieval ablations;
-- closed-loop Shadow Simulation;
-- custom identity maps and full benchmark configuration.
-
-See the root `README.md` for those commands.
+Use the existing CLI for Instagram/Kakao identity fusion, SELF twin experiments, dense retrieval ablations, closed-loop Shadow Simulation, custom identity maps, and full benchmark configuration.
 
 ## Build from source
 
@@ -107,5 +101,3 @@ pytest -q
 pyinstaller --noconfirm --clean --onefile --windowed --name Really-unREAL backend/gui_entry.py
 ./dist/Really-unREAL.exe --smoke
 ```
-
-The executable is written to `dist/Really-unREAL.exe` on Windows. The official workflow also executes the bundled `--smoke` path before packaging, which verifies that timezone data and the replay modules survived bundling.

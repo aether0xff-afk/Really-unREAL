@@ -13,6 +13,8 @@ def bundle_smoke() -> None:
     ZoneInfo("Asia/Seoul")
     import backend.gui_support  # noqa: F401
     import backend.gui_runtime  # noqa: F401
+    import backend.gui_live  # noqa: F401
+    import backend.gui_chat_window  # noqa: F401
     import backend.gui_responsive  # noqa: F401
     import backend.ingest.instagram  # noqa: F401
     import backend.replay_generation  # noqa: F401
