@@ -2,4 +2,4 @@ from backend import __version__
 
 
 def test_v1_package_version() -> None:
-    assert __version__ == "1.0.4"
+    assert __version__ == "1.0.5"
