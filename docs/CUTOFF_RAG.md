@@ -1,6 +1,6 @@
 # Cutoff-safe RAG and generation context
 
-Phase 2C begins only after the temporal model has decided that an action should exist. The language layer must never be allowed to decide whether to talk.
+Phase 2C begins only after the temporal layer has decided that an action should exist. The language layer must never be allowed to decide whether to talk.
 
 ## Two independent future-leakage barriers
 
@@ -26,17 +26,20 @@ The profile is source-weighted so Kakao remains primary and Instagram remains su
 
 ## Historical example unit
 
-The retrieval index is built from Historical Replay cases. Each historical example contains:
+The retrieval index is built from Historical Replay cases. Internally each historical example contains its real response so it can be evaluated and summarized, but **raw response text is not passed to the language model by default**.
+
+The generation packet exposes:
 
 ```text
-visible context before a real target action
-                +
-real target response burst
-                +
-source / timing metadata
+historical visible context
+response burst size
+per-bubble lengths
+question / laugh / cry counts
+short ending fragments
+source / recency / retrieval score
 ```
 
-At query time only the **visible current context** is used for ranking. The held-out current target burst is never read.
+instead of handing the model a past sentence to reuse. Raw historical response text can only be enabled explicitly for a copy-risk ablation with `raw_response_examples` / `--raw-rag-responses`.
 
 ## Retrieval score
 
@@ -48,48 +51,53 @@ The dependency-free baseline ranker combines:
 - source evidence weight;
 - a small same-platform preference.
 
-This is intentionally a baseline. A later embedding retriever must beat it under the same cutoff rules rather than silently replacing it.
+This is a **lexical similarity proxy**, not a learned semantic embedding. The compatibility field is still called `semantic_similarity` in the current result object, but documentation and experiments should not overclaim what it measures.
+
+When the action role is trustworthy, retrieval is action-aware: REPLY generation retrieves historical REPLY examples and INITIATE/follow-up generation retrieves the corresponding bucket. Long-gap ambiguous cases disable this filter rather than trusting a weak sender-order proxy.
 
 ## Generation packet
 
-`backend.generation_context.build_generation_context()` produces the only information a future language model may see:
+`backend.generation_context.build_generation_context()` produces the information a language model may see:
 
 ```text
-chosen action from temporal policy
+chosen coarse action from temporal policy
+long-gap action ambiguity flag
 visible recent conversation
 cutoff-safe weighted language profile
-cutoff-safe retrieved historical examples
+cutoff-safe historical contexts + response shapes
 ```
 
-The caller must provide `chosen_action`. The packet builder does not inspect the real held-out replay action, preserving the separation:
+The language profile now includes additional observable style statistics such as question/exclamation use, terminal-punctuation habits, multiline use, and frequent short endings. These are still surface behavior, not inferred feelings or personality traits.
+
+The caller supplies `chosen_action`. The packet builder does not inspect the real held-out replay target burst.
+
+## Copy control
+
+The default production path uses:
 
 ```text
-Temporal model
-    |
-    +--> WAIT  -> no generation
-    |
-    +--> REPLY / INITIATE
-              |
-              v
-       GenerationContextPacket
-              |
-              v
-             LLM
+raw_response_examples = 0
 ```
 
-## Current status
+The prompt explicitly tells the model to treat retrieved examples as situation/shape evidence and to prefer the current visible context. A future copy-rate evaluator can compare generated output with the hidden retrieval corpus, but raw nearest-neighbour responses do not need to be exposed merely to generate text.
 
-The repository now has the full pre-LLM path:
+## Evaluation
 
-```text
-raw exports
- -> identity/source fusion
- -> Historical Replay
- -> empirical/hazard temporal choice
- -> cutoff-safe retrieval
- -> cutoff-safe persona snapshot
- -> generation context packet
- -> [LLM required here]
-```
+Generation quality is intentionally split into multiple observable metrics rather than one misleading score:
 
-The next experiment needs an actual language model backend. The model should return only the message burst, not hidden emotional scores or chain-of-thought.
+- burst-size absolute error;
+- total character-length error;
+- character-bigram F1;
+- token F1;
+- short-ending F1;
+- laugh-expression presence match;
+- cry-expression presence match;
+- question presence match.
+
+These are still not a complete semantic evaluator. In particular, a future embedding or human evaluation layer is needed for paraphrases whose wording differs while meaning stays similar.
+
+## Source ablation
+
+`backend.nvidia_replay --sources both` compares Kakao-only and fused Kakao+Instagram evidence on the **same Kakao chronological held-out cases**. Instagram may change persona/retrieval evidence but not the benchmark split itself.
+
+That makes the current `0.55` Instagram DM weight a testable starting value rather than an assumed truth.
