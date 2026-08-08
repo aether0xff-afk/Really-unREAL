@@ -5,7 +5,7 @@ import re
 from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Iterable, Sequence
+from typing import Iterable, Protocol, Sequence
 
 from backend.fusion import EvidenceContext
 from backend.replay import ReplayCase
@@ -13,6 +13,11 @@ from backend.simulation.action_policy import Action
 
 
 _TOKEN_RE = re.compile(r"[0-9A-Za-z가-힣ㅋㅎㅠㅜ]+")
+
+
+class EmbeddingProvider(Protocol):
+    def embed(self, texts: Sequence[str]) -> Sequence[Sequence[float]]:
+        ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -34,10 +39,12 @@ class HistoricalExample:
 class RetrievedExample:
     example: HistoricalExample
     score: float
-    # Kept for compatibility with earlier callers. This is a lexical proxy,
-    # not a learned embedding/semantic score.
+    # Hybrid semantic score when an embedding provider is configured; lexical
+    # fallback otherwise. Kept under the old field name for caller compatibility.
     semantic_similarity: float
     recency_score: float
+    lexical_similarity: float = 0.0
+    embedding_similarity: float | None = None
 
 
 def historical_examples_from_replay(
@@ -108,6 +115,19 @@ def _counter_cosine(left: Counter[str], right: Counter[str]) -> float:
     return dot / (left_norm * right_norm)
 
 
+def _vector_cosine(left: Sequence[float], right: Sequence[float]) -> float:
+    if len(left) != len(right):
+        raise ValueError("embedding vectors must have the same dimension")
+    if not left:
+        return 0.0
+    dot = sum(float(a) * float(b) for a, b in zip(left, right))
+    left_norm = math.sqrt(sum(float(value) ** 2 for value in left))
+    right_norm = math.sqrt(sum(float(value) ** 2 for value in right))
+    if left_norm == 0 or right_norm == 0:
+        return 0.0
+    return max(0.0, min(1.0, dot / (left_norm * right_norm)))
+
+
 def _lexical_similarity(query_text: str, candidate_text: str) -> float:
     """Cheap local similarity fallback, deliberately not called an embedding."""
 
@@ -129,15 +149,45 @@ class CutoffExampleIndex:
 
     The index may be constructed from the full replay corpus for convenience,
     but ``search`` only considers examples whose real target action occurred
-    strictly before the requested cutoff. The current implementation uses a
-    lexical similarity proxy; a future embedding backend can replace the scorer
-    without changing the cutoff contract.
+    strictly before the requested cutoff.
+
+    With no embedding provider, retrieval remains dependency-free and lexical.
+    When a provider is configured, context-only dense embeddings are precomputed
+    and blended with lexical similarity. Target responses are never embedded for
+    ranking, preserving the anti-leakage contract.
     """
 
-    def __init__(self, examples: Iterable[HistoricalExample]) -> None:
+    def __init__(
+        self,
+        examples: Iterable[HistoricalExample],
+        *,
+        embedding_provider: EmbeddingProvider | None = None,
+        embedding_weight: float = 0.70,
+    ) -> None:
+        if not 0.0 <= embedding_weight <= 1.0:
+            raise ValueError("embedding_weight must be between 0 and 1")
         self.examples = tuple(
             sorted(examples, key=lambda example: (example.action_at, example.case_id))
         )
+        self.embedding_provider = embedding_provider
+        self.embedding_weight = float(embedding_weight)
+        self._embeddings: dict[str, tuple[float, ...]] = {}
+
+        if embedding_provider is not None and self.examples:
+            texts = [_normalized_text(example.context_texts) for example in self.examples]
+            vectors = list(embedding_provider.embed(texts))
+            if len(vectors) != len(self.examples):
+                raise ValueError("embedding provider returned unexpected vector count")
+            dimension: int | None = None
+            for example, vector in zip(self.examples, vectors):
+                values = tuple(float(value) for value in vector)
+                if not values:
+                    raise ValueError("embedding vectors must not be empty")
+                if dimension is None:
+                    dimension = len(values)
+                elif len(values) != dimension:
+                    raise ValueError("embedding vectors must have consistent dimensions")
+                self._embeddings[example.case_id] = values
 
     @classmethod
     def from_replay_cases(
@@ -145,12 +195,16 @@ class CutoffExampleIndex:
         cases: Iterable[ReplayCase],
         *,
         context_messages: int = 6,
+        embedding_provider: EmbeddingProvider | None = None,
+        embedding_weight: float = 0.70,
     ) -> "CutoffExampleIndex":
         return cls(
             historical_examples_from_replay(
                 cases,
                 context_messages=context_messages,
-            )
+            ),
+            embedding_provider=embedding_provider,
+            embedding_weight=embedding_weight,
         )
 
     def search(
@@ -176,6 +230,13 @@ class CutoffExampleIndex:
                 if message.message.text
             )
         )
+        query_embedding: tuple[float, ...] | None = None
+        if self.embedding_provider is not None:
+            vectors = list(self.embedding_provider.embed([query_text]))
+            if len(vectors) != 1:
+                raise ValueError("embedding provider must return one query vector")
+            query_embedding = tuple(float(value) for value in vectors[0])
+
         visible_timestamps = {
             message.message.timestamp
             for message in case.context
@@ -207,9 +268,21 @@ class CutoffExampleIndex:
 
             candidate_text = _normalized_text(example.context_texts)
             lexical = _lexical_similarity(query_text, candidate_text)
+            dense: float | None = None
+            semantic = lexical
+            if query_embedding is not None:
+                dense = _vector_cosine(
+                    query_embedding,
+                    self._embeddings[example.case_id],
+                )
+                semantic = (
+                    self.embedding_weight * dense
+                    + (1.0 - self.embedding_weight) * lexical
+                )
+
             recency = _recency_score(example.action_at, cutoff)
             source_weight = max(0.0, float(example.evidence_weight))
-            score = source_weight * (0.85 * lexical + 0.15 * recency)
+            score = source_weight * (0.85 * semantic + 0.15 * recency)
             if example.platform == case.platform:
                 score *= 1.05
             if score < minimum_score:
@@ -218,8 +291,10 @@ class CutoffExampleIndex:
                 RetrievedExample(
                     example=example,
                     score=score,
-                    semantic_similarity=lexical,
+                    semantic_similarity=semantic,
                     recency_score=recency,
+                    lexical_similarity=lexical,
+                    embedding_similarity=dense,
                 )
             )
 
