@@ -9,6 +9,8 @@ on:
       - "backend/**"
       - "tests/**"
       - "docs/QUICKSTART_GUI.md"
+      - "README.md"
+      - "RELEASE_NOTES_v1.0.1.md"
       - "pyproject.toml"
       - ".github/workflows/build-v1.0.1.yml"
   pull_request:
@@ -16,6 +18,8 @@ on:
       - "backend/**"
       - "tests/**"
       - "docs/QUICKSTART_GUI.md"
+      - "README.md"
+      - "RELEASE_NOTES_v1.0.1.md"
       - "pyproject.toml"
       - ".github/workflows/build-v1.0.1.yml"
 
@@ -72,22 +76,36 @@ jobs:
           path: Really-unREAL-v1.0.1-Windows-x64.zip
           retention-days: 14
 
-      - name: Publish readable build status
+      - name: Publish readable build statuses
         if: always()
         uses: actions/github-script@v7
         with:
           script: |
-            const ok = '${{ steps.tests.outcome }}' === 'success' &&
-                       '${{ steps.import_gui.outcome }}' === 'success' &&
-                       '${{ steps.build.outcome }}' === 'success' &&
-                       '${{ steps.package.outcome }}' === 'success';
+            const entries = [
+              ['v1.0.1-tests', '${{ steps.tests.outcome }}', 'pytest'],
+              ['v1.0.1-gui-import', '${{ steps.import_gui.outcome }}', 'GUI import'],
+              ['v1.0.1-pyinstaller', '${{ steps.build.outcome }}', 'PyInstaller'],
+              ['v1.0.1-package', '${{ steps.package.outcome }}', 'portable ZIP'],
+            ];
+            for (const [contextName, outcome, label] of entries) {
+              const ok = outcome === 'success';
+              await github.rest.repos.createCommitStatus({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                sha: context.sha,
+                state: ok ? 'success' : 'failure',
+                context: contextName,
+                description: ok ? `${label} passed` : `${label} outcome: ${outcome}`
+              });
+            }
+            const allOk = entries.every(([, outcome]) => outcome === 'success');
             await github.rest.repos.createCommitStatus({
               owner: context.repo.owner,
               repo: context.repo.repo,
               sha: context.sha,
-              state: ok ? 'success' : 'failure',
+              state: allOk ? 'success' : 'failure',
               context: 'v1.0.1-windows-build',
-              description: ok ? 'Tests passed and portable Windows GUI built' : 'v1.0.1 GUI build failed'
+              description: allOk ? 'Tests passed and portable Windows GUI built' : 'v1.0.1 GUI build failed'
             });
 
       - name: Fail when validation failed
