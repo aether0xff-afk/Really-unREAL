@@ -25,19 +25,33 @@ jobs:
       - name: Run pytest
         id: pytest
         continue-on-error: true
-        run: python -m pytest -q
+        shell: bash
+        run: |
+          set +e
+          python -m pytest -q 2>&1 | tee pytest.log
+          code=${PIPESTATUS[0]}
+          exit $code
       - name: Publish readable pytest status
         if: always() && github.event_name == 'push'
         uses: actions/github-script@v7
         with:
           script: |
+            const fs = require('fs');
             const passed = '${{ steps.pytest.outcome }}' === 'success';
+            let suffix = '';
+            if (!passed && fs.existsSync('pytest.log')) {
+              const lines = fs.readFileSync('pytest.log', 'utf8').split(/\r?\n/);
+              const failure = lines.find(line => line.startsWith('FAILED ') || line.startsWith('ERROR '));
+              if (failure) {
+                suffix = '|' + failure.replace(/^FAILED\s+|^ERROR\s+/, '').slice(0, 150);
+              }
+            }
             await github.rest.repos.createCommitStatus({
               owner: context.repo.owner,
               repo: context.repo.repo,
               sha: context.sha,
               state: passed ? 'success' : 'failure',
-              context: 'pytest-${{ matrix.python-version }}',
+              context: `pytest-${{ matrix.python-version }}${suffix}`,
               description: passed ? 'pytest passed' : 'pytest failed'
             });
       - name: Fail job when pytest failed
