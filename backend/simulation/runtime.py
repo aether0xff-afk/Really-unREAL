@@ -37,8 +37,6 @@ def _delay_for(
         return baseline.platform_thresholds[(platform, action)]
     if action in baseline.action_thresholds:
         return baseline.action_thresholds[action]
-    # Do not invent spontaneous INITIATE timing if history has no confident
-    # initiation examples. REPLY may still safely fall back to global timing.
     return baseline.global_threshold if action == Action.REPLY else None
 
 
@@ -51,7 +49,7 @@ def _generation_case(
     due_at: datetime,
     context: tuple[EvidenceMessage, ...],
 ) -> ReplayCase:
-    observation_end = context[-1].message.timestamp if context else due_at
+    previous_at = context[-1].message.timestamp if context else due_at
     return ReplayCase(
         case_id=f"live:{conversation_id}:{due_at.isoformat()}:{action.value}",
         person_id=twin_person_id,
@@ -60,11 +58,14 @@ def _generation_case(
         evidence_context=(context[-1].context if context else next(iter(_direct_contexts(platform)))),
         evidence_weight=1.0,
         action=action,
-        observation_end=observation_end,
+        # In live/shadow mode generation happens at due_at. This cutoff lets the
+        # packet use every observable fact that existed by decision time while
+        # still keeping future evidence out.
+        observation_end=due_at,
         action_at=due_at,
-        observed_delay_seconds=max(0.0, (due_at - observation_end).total_seconds()),
+        observed_delay_seconds=max(0.0, (due_at - previous_at).total_seconds()),
         delay_lower_seconds=0.0,
-        delay_upper_seconds=max(0.0, (due_at - observation_end).total_seconds()),
+        delay_upper_seconds=max(0.0, (due_at - previous_at).total_seconds()),
         context=context,
         target_burst=(),
         burst_size=0,
@@ -74,7 +75,6 @@ def _generation_case(
 
 
 def _direct_contexts(platform: str):
-    # Local import avoids making runtime depend on parser details at import time.
     from backend.fusion import EvidenceContext
 
     if platform == "kakao":
@@ -117,8 +117,6 @@ class LiveSimulationEngine:
         self.store = store
 
     def observe_counterpart_message(self, *, observed_at: datetime) -> ScheduledEvent:
-        """Replace any idle initiation with a reply scheduled from observed timing."""
-
         self.store.cancel_pending(
             twin_person_id=self.twin_person_id,
             platform=self.platform,
@@ -212,9 +210,6 @@ class LiveSimulationEngine:
                     burst=burst,
                 )
             )
-            # After a reply, one spontaneous follow-up may be scheduled if the
-            # history has a trustworthy INITIATE distribution. We intentionally
-            # do not chain INITIATE -> INITIATE forever.
             if event.action == Action.REPLY:
                 self.schedule_idle_initiation(after=event.due_at)
 
@@ -227,6 +222,4 @@ class LiveSimulationEngine:
         now: datetime,
         visible_context: tuple[EvidenceMessage, ...],
     ) -> list[SimulationEmission]:
-        """Process events that became due while the application was closed."""
-
         return self.process_due(now=now, visible_context=visible_context)
