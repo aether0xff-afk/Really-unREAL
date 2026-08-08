@@ -71,10 +71,14 @@ def _mean(values: list[float]) -> float | None:
 
 
 def _candidate_action(case: ReplayCase) -> Action:
+    """Generation action for an observed positive event without reading text."""
+
     if not case.context:
         raise ValueError("ReplayCase has no visible context")
+    if not case.action_is_ambiguous:
+        return case.action
     return (
-        Action.INITIATE
+        Action.FOLLOW_UP
         if case.context[-1].sender_person_id == case.person_id
         else Action.REPLY
     )
