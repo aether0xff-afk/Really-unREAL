@@ -84,7 +84,7 @@ observed: 120 s
 possible interval: 60 .. 180 s
 ```
 
-Timing metrics must respect that interval. A prediction inside the observed interval should not be penalized as if second-level ground truth existed.
+Timing metrics respect that interval. A prediction inside the observed interval is not penalized as if second-level ground truth existed.
 
 ## Leakage prevention
 
@@ -95,6 +95,22 @@ Replay has three leakage barriers:
 3. **Retrieval cutoff:** when RAG is added, retrieval for a replay case must only use memories that existed before that case's observation time. Building one vector index from the entire future conversation and retrieving from it would invalidate the experiment.
 
 The current implementation covers the first two barriers in the replay dataset. The retrieval layer must enforce the third before language-model evaluation is considered valid.
+
+## Empirical timing baseline
+
+`backend.replay_baseline.EmpiricalTimingBaseline` is the current floor model.
+
+It deliberately knows very little:
+
+- it derives the candidate action type from the **visible previous sender**;
+- it learns a weighted empirical timing quantile from the training split;
+- if enough samples exist, it conditions the threshold on platform and action type;
+- Kakao samples retain full evidence weight while Instagram DM samples are supplemental;
+- it predicts `WAIT` until the learned threshold, then predicts the observable candidate action.
+
+This is not intended to be a sophisticated human-timing model. Its purpose is to establish a reproducible floor. A later survival/hazard model is useful only if it improves held-out replay rather than merely sounding more complicated.
+
+Timing error is interval-aware: predicting anywhere inside a censored real interval receives zero timing error.
 
 ## CLI
 
@@ -108,13 +124,22 @@ python -m backend.replay_audit \
   person-001
 ```
 
-The command prints counts and timing statistics only; held-out private message text is not printed by default.
+The command prints:
+
+- replay event counts;
+- reply/initiation counts;
+- WAIT/action snapshot counts;
+- chronological train/validation/test sizes;
+- the empirical baseline's learned timing thresholds;
+- held-out test action accuracy/recall and interval-aware timing error.
+
+Held-out private message text is not printed by default.
 
 ## Evaluation order
 
 Phase 2 is intentionally staged:
 
-### 2A. Dataset validity
+### 2A. Dataset validity — implemented
 
 - parsing correctness
 - no future leakage
@@ -123,13 +148,13 @@ Phase 2 is intentionally staged:
 - timestamp censoring
 - chronological split
 
-### 2B. Temporal baseline
+### 2B. Temporal baseline — empirical floor implemented
 
-Fit a simple empirical/survival baseline on the training split and evaluate `WAIT / REPLY / INITIATE` plus timing on unseen later events.
+The weighted empirical quantile baseline is implemented. The next temporal model should be a proper survival/hazard model conditioned on observable context such as time of day, elapsed silence, recent session structure, and platform. It must beat the empirical floor on held-out later data.
 
 ### 2C. Content retrieval + generation
 
-Only after temporal behavior is valid do we add source-aware RAG and a language model. KakaoTalk remains primary evidence; Instagram stays supplemental.
+Only after temporal behavior is valid do we add cutoff-safe source-aware RAG and a language model. KakaoTalk remains primary evidence; Instagram stays supplemental.
 
 ### 2D. Historical ablation
 
