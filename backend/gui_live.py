@@ -150,8 +150,6 @@ class LiveChatSession:
             timing_sampler=timing_sampler,
             language_model=language_model,
             store=store,
-            # Two old REAL replies are enough to expose person-specific rhythm
-            # without turning the prompt into a transcript or retrieval copy path.
             raw_response_examples=2,
         )
 
@@ -225,7 +223,7 @@ class LiveChatSession:
             and event.platform == "kakao"
             and event.conversation_id == self.conversation_id
         ]
-        return min(matching, key=lambda event: event.due_at) if matching else None
+        return min(matching, key=lambda event: event.ready_at) if matching else None
 
     def ensure_idle_initiation(self, *, now: datetime | None = None) -> ScheduledEvent | None:
         if self.pending_event() is not None:
@@ -285,20 +283,8 @@ class LiveChatSession:
             conversation_id=self.conversation_id,
         )
 
-    def pending_label(self, *, now: datetime | None = None) -> str:
-        event = self.pending_event()
-        if event is None:
-            return f"대기 중 · timing={self.timing_model_name}"
-        if event.status == "BLOCKED":
-            return "답장 행동 보존됨 · 모델 설정 확인 후 재시도"
-        now = now or datetime.now()
-        remaining = max(0, int((event.due_at - now).total_seconds()))
-        if event.action == Action.REPLY:
-            prefix = "답장 예정"
-        else:
-            prefix = "먼저 메시지 가능성"
-        if event.status == "RETRY":
-            prefix += " · 생성 재시도"
+    @staticmethod
+    def _countdown(prefix: str, remaining: int) -> str:
         if remaining < 60:
             return f"{prefix} · 약 {remaining}초 후"
         minutes = remaining // 60
@@ -306,3 +292,18 @@ class LiveChatSession:
             return f"{prefix} · 약 {minutes}분 후"
         hours = minutes // 60
         return f"{prefix} · 약 {hours}시간 후"
+
+    def pending_label(self, *, now: datetime | None = None) -> str:
+        event = self.pending_event()
+        if event is None:
+            return "대기 중 · 상황 기반 타이밍"
+        if event.status == "BLOCKED":
+            return "답장 행동 보존됨 · 모델 설정 확인 후 재시도"
+        now = now or datetime.now()
+        if event.status == "RETRY":
+            remaining = max(0, int((event.ready_at - now).total_seconds()))
+            return self._countdown("답장 시각은 보존됨 · 생성 재시도", remaining)
+
+        remaining = max(0, int((event.due_at - now).total_seconds()))
+        prefix = "답장 예정" if event.action == Action.REPLY else "먼저 메시지 가능성"
+        return self._countdown(prefix, remaining)
