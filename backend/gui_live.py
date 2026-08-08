@@ -18,12 +18,12 @@ from backend.gui_support import (
     _target_evidence,
 )
 from backend.ingest.archive import ConversationExport
+from backend.live_timing import ContextualLiveTimingSampler
 from backend.privacy import require_private_context_route
 from backend.providers.nvidia import NvidiaNIMLanguageModel
 from backend.providers.openai_compatible import OpenAICompatibleLanguageModel
 from backend.replay import build_replay_cases
 from backend.replay_baseline import EmpiricalTimingBaseline
-from backend.replay_sampling import EmpiricalTimingSampler
 from backend.retrieval import CutoffExampleIndex
 from backend.simulation.action_policy import Action
 from backend.simulation.runtime import LiveSimulationEngine, SimulationEmission
@@ -115,7 +115,7 @@ class LiveChatSession:
         if not cases:
             raise ValueError("답장 시간을 학습할 수 있는 과거 대화가 부족합니다.")
         timing = EmpiricalTimingBaseline.fit(cases)
-        timing_sampler = EmpiricalTimingSampler(cases)
+        timing_sampler = ContextualLiveTimingSampler(cases, person_id=target_id)
         index = CutoffExampleIndex.from_replay_cases(cases)
         language_model = _language_model(
             provider=provider,
@@ -132,6 +132,7 @@ class LiveChatSession:
         self.evidence = evidence
         self.historical_conversation = selected
         self.store = store
+        self.timing_sampler = timing_sampler
         self.engine = LiveSimulationEngine(
             twin_person_id=target_id,
             platform="kakao",
@@ -147,6 +148,10 @@ class LiveChatSession:
     @property
     def conversation_id(self) -> str:
         return self.historical_conversation.conversation_id
+
+    @property
+    def timing_model_name(self) -> str:
+        return self.timing_sampler.model_name
 
     def _simulation_messages(self):
         return self.store.simulation_messages(
@@ -189,7 +194,10 @@ class LiveChatSession:
             messages=((now, text),),
             metadata={"role": "user", "ui_live": True},
         )
-        return self.engine.observe_counterpart_message(observed_at=now)
+        return self.engine.observe_counterpart_message(
+            observed_at=now,
+            visible_context=self._visible_context(),
+        )
 
     def process_due(self, *, now: datetime | None = None) -> list[SimulationEmission]:
         now = now or datetime.now()
@@ -215,7 +223,10 @@ class LiveChatSession:
         now = now or datetime.now()
         messages = self.chat_messages()
         after = messages[-1].timestamp if messages else now
-        return self.engine.schedule_idle_initiation(after=after)
+        return self.engine.schedule_idle_initiation(
+            after=after,
+            visible_context=self._visible_context(),
+        )
 
     def defer_generation_failure(
         self,
@@ -267,7 +278,7 @@ class LiveChatSession:
     def pending_label(self, *, now: datetime | None = None) -> str:
         event = self.pending_event()
         if event is None:
-            return "대기 중"
+            return f"대기 중 · timing={self.timing_model_name}"
         if event.status == "BLOCKED":
             return "답장 행동 보존됨 · 모델 설정 확인 후 재시도"
         now = now or datetime.now()
