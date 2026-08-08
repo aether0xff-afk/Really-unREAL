@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import statistics
 from dataclasses import dataclass
 
@@ -11,11 +12,13 @@ from backend.generation_context import build_generation_context
 from backend.identity import IdentityMap
 from backend.ingest.archive import load_kakao_archive
 from backend.ingest.instagram import load_instagram_export
+from backend.providers.embeddings import OpenAICompatibleEmbeddingProvider
 from backend.providers.nvidia import NvidiaNIMLanguageModel
 from backend.replay import ReplayCase, build_replay_cases, chronological_split
 from backend.replay_hazard import select_temporal_model
-from backend.retrieval import CutoffExampleIndex
+from backend.retrieval import CutoffExampleIndex, EmbeddingProvider
 from backend.simulation.action_policy import Action
+from backend.twin import TwinMode, resolve_twin_spec
 
 
 @dataclass(frozen=True, slots=True)
@@ -38,6 +41,7 @@ class ReplayGenerationSummary:
     laugh_presence_match_rate: float | None
     cry_presence_match_rate: float | None
     question_presence_match_rate: float | None
+    retrieval_backend: str = "lexical"
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -59,6 +63,7 @@ class ReplayGenerationSummary:
             "laugh_presence_match_rate": self.laugh_presence_match_rate,
             "cry_presence_match_rate": self.cry_presence_match_rate,
             "question_presence_match_rate": self.question_presence_match_rate,
+            "retrieval_backend": self.retrieval_backend,
         }
 
 
@@ -113,7 +118,8 @@ def _fixed_kakao_split(
 
     Source ablations must evaluate the same future cases. Instagram may enrich
     generation evidence, but it must not move the train/test boundary or change
-    which Kakao events are scored.
+    which Kakao events are scored. This works for PERSON and SELF twins because
+    replay labels are target-relative in direct conversations.
     """
 
     kakao_evidence = _filter_evidence(evidence, "kakao")
@@ -135,11 +141,13 @@ def run_nvidia_replay(
     test_platform: str = "kakao",
     model_name: str = "nvidia/nemotron-3-ultra-550b-a55b",
     raw_response_examples: int = 0,
+    embedding_provider: EmbeddingProvider | None = None,
+    embedding_weight: float = 0.70,
 ) -> ReplayGenerationSummary:
     if source_mode not in {"kakao", "fused"}:
         raise ValueError("source_mode must be 'kakao' or 'fused'")
 
-    kakao_evidence, _, split = _fixed_kakao_split(
+    _, _, split = _fixed_kakao_split(
         evidence,
         self_person_id=self_person_id,
     )
@@ -153,7 +161,11 @@ def run_nvidia_replay(
         generation_evidence,
         self_person_id=self_person_id,
     )
-    index = CutoffExampleIndex.from_replay_cases(generation_cases)
+    index = CutoffExampleIndex.from_replay_cases(
+        generation_cases,
+        embedding_provider=embedding_provider,
+        embedding_weight=embedding_weight,
+    )
     model = NvidiaNIMLanguageModel(model=model_name)
 
     # The scored set is always the same Kakao-only chronological test set. This
@@ -227,6 +239,7 @@ def run_nvidia_replay(
         laugh_presence_match_rate=_mean(laugh_matches),
         cry_presence_match_rate=_mean(cry_matches),
         question_presence_match_rate=_mean(question_matches),
+        retrieval_backend=("dense+lexical" if embedding_provider else "lexical"),
     )
 
 
@@ -262,12 +275,21 @@ def compare_source_summaries(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Run privacy-preserving NVIDIA NIM generation on held-out replay cases"
+        description="Run NVIDIA NIM generation on leakage-safe held-out replay cases"
     )
     parser.add_argument("kakao_archive")
     parser.add_argument("instagram_archive")
     parser.add_argument("identity_map")
-    parser.add_argument("person_id")
+    parser.add_argument(
+        "person_id",
+        nargs="?",
+        help="Target person ID for PERSON mode. Omit with --self-twin.",
+    )
+    parser.add_argument(
+        "--self-twin",
+        action="store_true",
+        help="Target the identity map's is_self=true person instead of another person",
+    )
     parser.add_argument(
         "--sources",
         choices=("kakao", "fused", "both"),
@@ -289,47 +311,75 @@ def main() -> None:
         default=0,
         help="Explicit copy-risk ablation only; production default is 0",
     )
+    parser.add_argument(
+        "--embedding-base-url",
+        help="Optional OpenAI-compatible embedding base URL; prefer a local endpoint",
+    )
+    parser.add_argument(
+        "--embedding-model",
+        help="Embedding model name required with --embedding-base-url",
+    )
+    parser.add_argument(
+        "--embedding-weight",
+        type=float,
+        default=0.70,
+        help="Dense share of retrieval similarity; lexical fallback uses the remainder",
+    )
     args = parser.parse_args()
 
     identities = IdentityMap.from_json(args.identity_map)
-    self_person_id = identities.self_person_id
-    if self_person_id is None:
-        raise SystemExit("identity map must contain exactly one is_self=true person")
+    try:
+        spec = resolve_twin_spec(
+            identities,
+            mode=TwinMode.SELF if args.self_twin else TwinMode.PERSON,
+            person_id=args.person_id,
+        )
+    except (KeyError, ValueError) as exc:
+        raise SystemExit(str(exc)) from exc
+
+    if bool(args.embedding_base_url) != bool(args.embedding_model):
+        raise SystemExit("--embedding-base-url and --embedding-model must be supplied together")
+    embedding_provider: EmbeddingProvider | None = None
+    if args.embedding_base_url:
+        embedding_provider = OpenAICompatibleEmbeddingProvider(
+            base_url=args.embedding_base_url,
+            model=args.embedding_model,
+            api_key=os.environ.get("EMBEDDING_API_KEY"),
+        )
 
     kakao = load_kakao_archive(args.kakao_archive)
     instagram = load_instagram_export(args.instagram_archive)
     evidence = collect_person_evidence(
-        args.person_id,
+        spec.target_person_id,
         identities,
         kakao_conversations=kakao,
         instagram_threads=instagram.threads,
     )
 
     privacy = (
-        "Only aggregate evaluation metrics are printed. Private prompts, retrieved "
-        "examples, generated messages, and held-out real messages are not logged."
+        "Only aggregate evaluation metrics are printed. Private prompts, generated "
+        "messages, and held-out real messages are not logged. NVIDIA generation sends "
+        "the generation packet to the configured NVIDIA endpoint. If an embedding "
+        "endpoint is configured, retrieval context is also sent to that endpoint; use "
+        "a local embedding endpoint to keep that text on-device."
+    )
+
+    common = dict(
+        evidence=evidence,
+        self_person_id=spec.self_person_id,
+        limit=args.limit,
+        test_platform=args.test_platform,
+        model_name=args.model,
+        raw_response_examples=args.raw_rag_responses,
+        embedding_provider=embedding_provider,
+        embedding_weight=args.embedding_weight,
     )
 
     if args.sources == "both":
-        kakao_summary = run_nvidia_replay(
-            evidence=evidence,
-            self_person_id=self_person_id,
-            source_mode="kakao",
-            limit=args.limit,
-            test_platform=args.test_platform,
-            model_name=args.model,
-            raw_response_examples=args.raw_rag_responses,
-        )
-        fused_summary = run_nvidia_replay(
-            evidence=evidence,
-            self_person_id=self_person_id,
-            source_mode="fused",
-            limit=args.limit,
-            test_platform=args.test_platform,
-            model_name=args.model,
-            raw_response_examples=args.raw_rag_responses,
-        )
+        kakao_summary = run_nvidia_replay(source_mode="kakao", **common)
+        fused_summary = run_nvidia_replay(source_mode="fused", **common)
         output: dict[str, object] = {
+            "twin_mode": spec.mode.value,
             "kakao": kakao_summary.to_dict(),
             "fused": fused_summary.to_dict(),
             "fused_minus_kakao": compare_source_summaries(
@@ -339,16 +389,9 @@ def main() -> None:
             "privacy": privacy,
         }
     else:
-        summary = run_nvidia_replay(
-            evidence=evidence,
-            self_person_id=self_person_id,
-            source_mode=args.sources,
-            limit=args.limit,
-            test_platform=args.test_platform,
-            model_name=args.model,
-            raw_response_examples=args.raw_rag_responses,
-        )
+        summary = run_nvidia_replay(source_mode=args.sources, **common)
         output = summary.to_dict()
+        output["twin_mode"] = spec.mode.value
         output["privacy"] = privacy
 
     print(json.dumps(output, ensure_ascii=False, indent=2))
