@@ -23,6 +23,7 @@ from backend.providers.nvidia import NvidiaNIMLanguageModel
 from backend.providers.openai_compatible import OpenAICompatibleLanguageModel
 from backend.replay import build_replay_cases
 from backend.replay_baseline import EmpiricalTimingBaseline
+from backend.replay_sampling import EmpiricalTimingSampler
 from backend.retrieval import CutoffExampleIndex
 from backend.simulation.action_policy import Action
 from backend.simulation.runtime import LiveSimulationEngine, SimulationEmission
@@ -78,6 +79,8 @@ class LiveChatSession:
     User-entered and model-generated messages are stored as SIMULATION only.
     Historical Kakao messages remain REAL evidence and are never copied into the
     live database. The engine schedules reply/initiation time before generation.
+    Live delays are sampled from historical replay intervals rather than reusing
+    a single median delay on every turn.
     """
 
     def __init__(
@@ -119,6 +122,7 @@ class LiveChatSession:
         if not cases:
             raise ValueError("답장 시간을 학습할 수 있는 과거 대화가 부족합니다.")
         timing = EmpiricalTimingBaseline.fit(cases)
+        timing_sampler = EmpiricalTimingSampler(cases)
         index = CutoffExampleIndex.from_replay_cases(cases)
         language_model = _language_model(
             provider=provider,
@@ -142,6 +146,7 @@ class LiveChatSession:
             evidence=evidence,
             retrieval_index=index,
             timing=timing,
+            timing_sampler=timing_sampler,
             language_model=language_model,
             store=store,
         )
