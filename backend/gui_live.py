@@ -19,7 +19,8 @@ from backend.gui_support import (
     _target_evidence,
 )
 from backend.ingest.archive import ConversationExport
-from backend.live_timing import ContextualLiveTimingSampler
+from backend.live_behavior import LatentReadTimingModel, LiveResponsePolicy, TargetContinuationPolicy
+from backend.live_timing import BurstGapSampler, ContextualLiveTimingSampler
 from backend.privacy import require_private_context_route
 from backend.providers.nvidia import NvidiaNIMLanguageModel
 from backend.providers.openai_compatible import OpenAICompatibleLanguageModel
@@ -29,6 +30,9 @@ from backend.retrieval import CutoffExampleIndex
 from backend.simulation.action_policy import Action
 from backend.simulation.runtime import LiveSimulationEngine, SimulationEmission
 from backend.simulation.store import SQLiteSimulationStore, ScheduledEvent
+
+
+_INPUT_SETTLE_SECONDS = 3.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -76,7 +80,7 @@ def _language_model(
 
 
 class LiveChatSession:
-    """Desktop adapter around the persistent LiveSimulationEngine."""
+    """Desktop adapter around the persistent 1.2 behavior runtime."""
 
     def __init__(
         self,
@@ -115,9 +119,19 @@ class LiveChatSession:
 
         cases = build_replay_cases(evidence, self_person_id="self")
         if not cases:
-            raise ValueError("답장 시간을 학습할 수 있는 과거 대화가 부족합니다.")
+            raise ValueError("행동 시간을 학습할 수 있는 과거 대화가 부족합니다.")
         timing = EmpiricalTimingBaseline.fit(cases)
         timing_sampler = ContextualLiveTimingSampler(cases, person_id=target_id)
+        response_policy = LiveResponsePolicy.from_evidence(
+            evidence,
+            self_person_id="self",
+            focus_conversation_id=selected.conversation_id,
+        )
+        continuation_policy = TargetContinuationPolicy.from_evidence(
+            evidence,
+            focus_conversation_id=selected.conversation_id,
+        )
+        burst_gap_sampler = BurstGapSampler(cases)
         index = CutoffExampleIndex.from_replay_cases(cases)
         base_language_model = _language_model(
             provider=provider,
@@ -127,11 +141,12 @@ class LiveChatSession:
         )
         language_model = GuardedBurstLanguageModel(
             base_language_model,
-            max_attempts=2,
+            max_attempts=3,
             copy_threshold=0.82,
             min_reference_chars=8,
         )
         store = SQLiteSimulationStore(store_path or default_live_store_path())
+        store.recover_stale_claims(now=datetime.now())
 
         self.self_alias = self_alias
         self.target_alias = target_alias
@@ -141,10 +156,8 @@ class LiveChatSession:
         self.historical_conversation = selected
         self.store = store
         self.timing_sampler = timing_sampler
+        self.response_policy = response_policy
 
-        # <=1.1.0 sessions did not store read receipts. If an old simulation
-        # already contains a target reply, conservatively mark preceding user
-        # messages as read at that simulated reply time.
         self.store.backfill_read_receipts(
             twin_person_id=target_id,
             platform="kakao",
@@ -159,6 +172,10 @@ class LiveChatSession:
             retrieval_index=index,
             timing=timing,
             timing_sampler=timing_sampler,
+            response_policy=response_policy,
+            continuation_policy=continuation_policy,
+            read_timing_model=LatentReadTimingModel(),
+            burst_gap_sampler=burst_gap_sampler,
             language_model=language_model,
             store=store,
             raw_response_examples=2,
@@ -209,7 +226,51 @@ class LiveChatSession:
         )
         return historical + simulated
 
-    def send_user_message(self, text: str, *, now: datetime | None = None) -> ScheduledEvent:
+    def _active(self, action: Action) -> list[ScheduledEvent]:
+        return self.store.active_events(
+            twin_person_id=self.target_person_id,
+            platform="kakao",
+            conversation_id=self.conversation_id,
+            action=action,
+        )
+
+    def _ensure_read_for_new_bubble(
+        self,
+        *,
+        sent_at: datetime,
+        reply_due_at: datetime,
+    ) -> None:
+        # A future READ already covers any message sent before its due time. If
+        # the previous READ has already fired (or is overdue), schedule a separate
+        # inferred READ for the newly appended bubble without moving the old one.
+        covering = [
+            event
+            for event in self._active(Action.READ)
+            if event.status in {"PENDING", "RETRY"} and event.due_at >= sent_at
+        ]
+        if covering:
+            return
+        model = self.engine.read_timing_model
+        if model is None:
+            return
+        remaining = max(0.0, (reply_due_at - sent_at).total_seconds())
+        read_delay = model.sample_delay_seconds(remaining)
+        self.store.schedule(
+            twin_person_id=self.target_person_id,
+            platform="kakao",
+            conversation_id=self.conversation_id,
+            action=Action.READ,
+            due_at=min(reply_due_at, sent_at + timedelta(seconds=read_delay)),
+            created_at=sent_at,
+            replace_same_action=False,
+        )
+
+    def send_user_message(
+        self,
+        text: str,
+        *,
+        now: datetime | None = None,
+    ) -> ScheduledEvent | None:
         text = text.strip()
         if not text:
             raise ValueError("메시지를 입력하세요.")
@@ -224,12 +285,38 @@ class LiveChatSession:
                 "role": "user",
                 "ui_live": True,
                 "read_status": "UNREAD",
-                "read_receipt_source": "SIMULATION_INFERENCE",
+                "read_receipt_source": "SIMULATION_INFERENCE_PENDING",
             },
         )
+
+        # A rapid multi-bubble user turn joins the existing unclaimed REPLY. The
+        # reply clock is not re-sampled; only a tiny settle floor prevents firing
+        # in the middle of typing.
+        future_replies = [
+            event
+            for event in self._active(Action.REPLY)
+            if event.status == "PENDING" and event.due_at > now
+        ]
+        if future_replies:
+            event = min(future_replies, key=lambda item: item.due_at)
+            try:
+                event = self.store.postpone_pending_event(
+                    event.event_id,
+                    not_before=now + timedelta(seconds=_INPUT_SETTLE_SECONDS),
+                )
+            except KeyError:
+                pass
+            self._ensure_read_for_new_bubble(sent_at=now, reply_due_at=event.due_at)
+            return event
+
+        # A CLAIMED/RETRY/BLOCKED old reply belongs to its original causal cutoff.
+        # A later user message gets a separate behavior decision and cannot cancel
+        # or mutate that in-flight action.
+        has_old_reply = bool(self._active(Action.REPLY))
         return self.engine.observe_counterpart_message(
             observed_at=now,
             visible_context=self._visible_context(),
+            replace_existing_reply=not has_old_reply,
         )
 
     def process_due(self, *, now: datetime | None = None) -> list[SimulationEmission]:
@@ -240,14 +327,15 @@ class LiveChatSession:
         now = now or datetime.now()
         return self.engine.recover(now=now, visible_context=self._visible_context())
 
+    def pending_events(self) -> list[ScheduledEvent]:
+        return self.store.active_events(
+            twin_person_id=self.target_person_id,
+            platform="kakao",
+            conversation_id=self.conversation_id,
+        )
+
     def pending_event(self) -> ScheduledEvent | None:
-        matching = [
-            event
-            for event in self.store.pending_events()
-            if event.twin_person_id == self.target_person_id
-            and event.platform == "kakao"
-            and event.conversation_id == self.conversation_id
-        ]
+        matching = self.pending_events()
         return min(matching, key=lambda event: event.ready_at) if matching else None
 
     def ensure_idle_initiation(self, *, now: datetime | None = None) -> ScheduledEvent | None:
@@ -265,9 +353,10 @@ class LiveChatSession:
         self,
         error: Exception,
         *,
+        event_id: str | None = None,
         now: datetime | None = None,
     ) -> ScheduledEvent | None:
-        event = self.pending_event()
+        event = self.store.event(event_id) if event_id else self.pending_event()
         if event is None:
             return None
         now = now or datetime.now()
@@ -279,16 +368,22 @@ class LiveChatSession:
             error=str(error),
         )
 
-    def block_generation_failure(self, error: Exception) -> ScheduledEvent | None:
-        event = self.pending_event()
+    def block_generation_failure(
+        self,
+        error: Exception,
+        *,
+        event_id: str | None = None,
+    ) -> ScheduledEvent | None:
+        event = self.store.event(event_id) if event_id else self.pending_event()
         if event is None:
             return None
         return self.store.block_event(event.event_id, error=str(error))
 
     def retry_blocked(self, *, now: datetime | None = None) -> ScheduledEvent | None:
-        event = self.pending_event()
-        if event is None or event.status != "BLOCKED":
-            return event
+        blocked = [event for event in self.pending_events() if event.status == "BLOCKED"]
+        if not blocked:
+            return self.pending_event()
+        event = min(blocked, key=lambda item: item.due_at)
         return self.store.retry_blocked_event(
             event.event_id,
             retry_at=now or datetime.now(),
@@ -316,19 +411,29 @@ class LiveChatSession:
         if minutes < 60:
             return f"{prefix} · 약 {minutes}분 후"
         hours = minutes // 60
-        return f"{prefix} · 약 {hours}시간 후"
+        if hours < 24:
+            return f"{prefix} · 약 {hours}시간 후"
+        return f"{prefix} · 약 {hours // 24}일 후"
 
     def pending_label(self, *, now: datetime | None = None) -> str:
         event = self.pending_event()
         if event is None:
-            return "대기 중 · 상황 기반 타이밍"
-        if event.status == "BLOCKED":
-            return "답장 행동 보존됨 · 모델 설정 확인 후 재시도"
+            probability = round(self.response_policy.global_reply_probability * 100)
+            return f"대기 중 · REPLY/WAIT 모델 · 과거 전체 답장률 약 {probability}%"
         now = now or datetime.now()
+        if event.status == "BLOCKED":
+            return "메시지 행동 보존됨 · 모델 설정 확인 후 생성 재시도"
+        if event.status == "CLAIMED":
+            return "예약된 행동 실행 중…"
         if event.status == "RETRY":
             remaining = max(0, int((event.ready_at - now).total_seconds()))
-            return self._countdown("답장 시각은 보존됨 · 생성 재시도", remaining)
+            return self._countdown("행동 시각 보존됨 · 생성 재시도", remaining)
 
         remaining = max(0, int((event.due_at - now).total_seconds()))
-        prefix = "답장 예정" if event.action == Action.REPLY else "먼저 메시지 가능성"
-        return self._countdown(prefix, remaining)
+        labels = {
+            Action.READ: "읽음 추정 예정",
+            Action.REPLY: "답장 예정",
+            Action.FOLLOW_UP: "추가 메시지 가능성",
+            Action.INITIATE: "선톡 가능성",
+        }
+        return self._countdown(labels.get(event.action, event.action.value), remaining)

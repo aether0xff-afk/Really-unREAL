@@ -2,13 +2,18 @@ from __future__ import annotations
 
 import math
 import random
+import re
 from collections import Counter, defaultdict
 from dataclasses import asdict, dataclass
 from datetime import timedelta
 from typing import Iterable, Sequence
 
 from backend.replay import ActionSnapshot, ReplayCase, build_action_snapshots
-from backend.replay_baseline import EmpiricalTimingBaseline, ReplayBaselineMetrics, evaluate_empirical_baseline
+from backend.replay_baseline import (
+    EmpiricalTimingBaseline,
+    ReplayBaselineMetrics,
+    evaluate_empirical_baseline,
+)
 from backend.simulation.action_policy import Action
 
 
@@ -26,6 +31,29 @@ ELAPSED_BINS_SECONDS: tuple[float, ...] = (
     7776000.0,
     31536000.0,
 )
+_SESSION_GAP_SECONDS = 6.0 * 3600.0
+_INTERROGATIVE_RE = re.compile(
+    r"(^|\s)(뭐|왜|언제|어디|누구|누가|몇|어떻게|어케|얼마|어느)(\s|$)"
+)
+_QUESTION_STEMS = (
+    "뭐함",
+    "뭐해",
+    "뭐하",
+    "몇시",
+    "몇명",
+    "몇개",
+    "어디감",
+    "어디가",
+    "언제감",
+    "언제와",
+    "어떻게",
+    "어케",
+    "얼마",
+    "가능함",
+    "가능해",
+    "맞음",
+    "맞아",
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -35,6 +63,7 @@ class HazardMetrics:
     balanced_accuracy: float
     wait_recall: float | None
     reply_recall: float | None
+    follow_up_recall: float | None
     initiate_recall: float | None
     mean_interval_error_seconds: float | None
     median_interval_error_seconds: float | None
@@ -58,11 +87,13 @@ class TemporalModelSelection:
         return asdict(self)
 
 
-def _candidate_action(case: ReplayCase) -> Action:
+def _candidate_action(case: ReplayCase, elapsed_seconds: float = 0.0) -> Action:
     if not case.context:
         raise ValueError("ReplayCase has no visible context")
     previous_sender = case.context[-1].sender_person_id
-    return Action.INITIATE if previous_sender == case.person_id else Action.REPLY
+    if previous_sender != case.person_id:
+        return Action.REPLY
+    return Action.INITIATE if elapsed_seconds > _SESSION_GAP_SECONDS else Action.FOLLOW_UP
 
 
 def _elapsed_bin(seconds: float) -> int:
@@ -77,8 +108,7 @@ def _activity_bucket(case: ReplayCase, elapsed_seconds: float) -> str:
     observed_at = case.observation_end + timedelta(seconds=elapsed_seconds)
     cutoff = observed_at - timedelta(minutes=15)
     count = sum(
-        cutoff <= message.message.timestamp <= case.observation_end
-        for message in case.context
+        cutoff <= message.message.timestamp <= observed_at for message in case.context
     )
     if count <= 0:
         return "0"
@@ -110,27 +140,75 @@ def _previous_gap_bucket(case: ReplayCase) -> str:
     return ">2h"
 
 
+def _since_last_bucket(case: ReplayCase, elapsed_seconds: float) -> str:
+    if not case.context:
+        return "unknown"
+    base_gap = max(
+        0.0,
+        (case.observation_end - case.context[-1].message.timestamp).total_seconds(),
+    )
+    elapsed = base_gap + max(0.0, float(elapsed_seconds))
+    if elapsed <= 60:
+        return "<=1m"
+    if elapsed <= 300:
+        return "<=5m"
+    if elapsed <= 1800:
+        return "<=30m"
+    if elapsed <= 7200:
+        return "<=2h"
+    if elapsed <= 21600:
+        return "<=6h"
+    if elapsed <= 86400:
+        return "<=1d"
+    if elapsed <= 604800:
+        return "<=7d"
+    return ">7d"
+
+
+def _message_kind(case: ReplayCase) -> str:
+    if not case.context:
+        return "none"
+    text = case.context[-1].message.text.strip()
+    compact = "".join(text.split())
+    if (
+        "?" in text
+        or _INTERROGATIVE_RE.search(text)
+        or any(stem in compact for stem in _QUESTION_STEMS)
+    ):
+        return "question"
+    if len(compact) <= 4:
+        return "very_short"
+    return "statement"
+
+
 def _feature_tuple(case: ReplayCase, elapsed_seconds: float) -> tuple[object, ...]:
     observed_at = case.observation_end + timedelta(seconds=elapsed_seconds)
+    # Action identity must itself be observable at this elapsed time. In
+    # particular, a future long-gap INITIATE cannot leak its held-out label into
+    # earlier survival bins where it is still only a possible FOLLOW_UP.
+    action = _candidate_action(case, elapsed_seconds)
     return (
-        _candidate_action(case).value,
+        action.value,
         case.platform,
         observed_at.hour // 4,
         int(observed_at.weekday() >= 5),
         _activity_bucket(case, elapsed_seconds),
         _previous_gap_bucket(case),
+        _since_last_bucket(case, elapsed_seconds),
+        _message_kind(case),
     )
 
 
 def _feature_keys(feature: tuple[object, ...]) -> tuple[tuple[object, ...], ...]:
-    action, platform, hour_band, weekend, activity, previous_gap = feature
+    action, platform, hour_band, weekend, activity, previous_gap, since_last, kind = feature
     return (
         (),
         (action,),
-        (action, activity),
-        (action, hour_band, activity),
-        (action, hour_band, weekend, activity, previous_gap),
-        (action, platform, hour_band, weekend, activity, previous_gap),
+        (action, kind),
+        (action, activity, since_last, kind),
+        (action, hour_band, activity, since_last, kind),
+        (action, hour_band, weekend, activity, previous_gap, since_last, kind),
+        (action, platform, hour_band, weekend, activity, previous_gap, since_last, kind),
     )
 
 
@@ -143,20 +221,7 @@ def _interval_error_seconds(prediction: float, case: ReplayCase) -> float:
 
 
 class DiscreteHazardModel:
-    """Source-weighted, context-conditioned discrete-time hazard model.
-
-    The model estimates the probability that the target acts in the current
-    elapsed-time bin given that no target action has happened yet. Features are
-    deliberately observable at prediction time: reply-vs-follow-up proxy,
-    platform, time of day, weekend, recent conversation activity, and the gap
-    between the last two visible messages.
-
-    Long-gap events whose REPLY/INITIATE role is ambiguous still inform the
-    global survival curve, but they do not update action-conditioned feature
-    cells. Sparse feature cells back off through a hierarchy and are smoothed
-    toward the global hazard for the same elapsed-time bin. No held-out message
-    text is used.
-    """
+    """Source-weighted discrete survival model over observable context."""
 
     def __init__(
         self,
@@ -189,9 +254,10 @@ class DiscreteHazardModel:
         if prior_strength < 0:
             raise ValueError("prior_strength must be >= 0")
 
+        levels = len(_feature_keys(("x", "x", 0, 0, "x", "x", "x", "x")))
         mutable_tables: list[
             defaultdict[tuple[tuple[object, ...], int], list[float]]
-        ] = [defaultdict(lambda: [0.0, 0.0]) for _ in range(6)]
+        ] = [defaultdict(lambda: [0.0, 0.0]) for _ in range(levels)]
 
         for case in cases:
             event_bin = _elapsed_bin(case.observed_delay_seconds)
@@ -200,12 +266,8 @@ class DiscreteHazardModel:
                 continue
             for bin_index in range(event_bin + 1):
                 elapsed = ELAPSED_BINS_SECONDS[bin_index]
-                feature = _feature_tuple(case, elapsed)
-                keys = _feature_keys(feature)
+                keys = _feature_keys(_feature_tuple(case, elapsed))
                 for level, key in enumerate(keys):
-                    # Level 0 is the action-agnostic global survival curve. A
-                    # long-gap event can safely inform *when* something happened,
-                    # but not whether that event was a reply or new initiation.
                     if level > 0 and case.action_is_ambiguous:
                         continue
                     cell = mutable_tables[level][(key, bin_index)]
@@ -213,14 +275,10 @@ class DiscreteHazardModel:
                     if bin_index == event_bin:
                         cell[1] += weight
 
-        frozen_tables: list[
-            dict[tuple[tuple[object, ...], int], tuple[float, float]]
-        ] = []
-        for table in mutable_tables:
-            frozen_tables.append(
-                {key: (value[0], value[1]) for key, value in table.items()}
-            )
-
+        frozen_tables = tuple(
+            {key: (value[0], value[1]) for key, value in table.items()}
+            for table in mutable_tables
+        )
         global_hazards: list[float] = []
         for bin_index in range(len(ELAPSED_BINS_SECONDS) - 1):
             risk, events = frozen_tables[0].get(((), bin_index), (0.0, 0.0))
@@ -229,14 +287,13 @@ class DiscreteHazardModel:
         return cls(
             minimum_effective_risk=minimum_effective_risk,
             prior_strength=prior_strength,
-            tables=tuple(frozen_tables),
+            tables=frozen_tables,
             global_hazards=tuple(global_hazards),
         )
 
     def hazard_probability(self, case: ReplayCase, *, elapsed_seconds: float) -> float:
         bin_index = _elapsed_bin(elapsed_seconds)
-        feature = _feature_tuple(case, ELAPSED_BINS_SECONDS[bin_index])
-        keys = _feature_keys(feature)
+        keys = _feature_keys(_feature_tuple(case, ELAPSED_BINS_SECONDS[bin_index]))
         global_hazard = self.global_hazards[bin_index]
 
         for level in range(len(keys) - 1, -1, -1):
@@ -265,7 +322,7 @@ class DiscreteHazardModel:
     ) -> Action:
         threshold = self.decision_threshold if threshold is None else float(threshold)
         probability = self.hazard_probability(case, elapsed_seconds=elapsed_seconds)
-        return _candidate_action(case) if probability >= threshold else Action.WAIT
+        return _candidate_action(case, elapsed_seconds) if probability >= threshold else Action.WAIT
 
     def predict_median_delay_seconds(self, case: ReplayCase) -> float:
         survival = 1.0
@@ -291,7 +348,9 @@ class DiscreteHazardModel:
         case: ReplayCase,
         *,
         seed: int | None = None,
-    ) -> float:
+    ) -> float | None:
+        """Sample an event time; return None when the survival mass says WAIT."""
+
         rng = random.Random(seed)
         target = rng.random()
         survival = 1.0
@@ -305,7 +364,7 @@ class DiscreteHazardModel:
                 return start + rng.random() * (end - start)
             cumulative += event_mass
             survival *= 1.0 - hazard
-        return ELAPSED_BINS_SECONDS[-1]
+        return None
 
     def tune_decision_threshold(
         self,
@@ -407,6 +466,7 @@ def evaluate_hazard_model(
         ),
         wait_recall=recalls[Action.WAIT],
         reply_recall=recalls[Action.REPLY],
+        follow_up_recall=recalls[Action.FOLLOW_UP],
         initiate_recall=recalls[Action.INITIATE],
         mean_interval_error_seconds=(
             round(mean_error, 3) if mean_error is not None else None
@@ -432,12 +492,6 @@ def select_temporal_model(
     ReplayBaselineMetrics,
     HazardMetrics,
 ]:
-    """Choose hazard only when it earns the complexity on held-out validation.
-
-    This prevents a sparse person's small history from being overfit by a richer
-    context model. The empirical timing baseline remains the fallback.
-    """
-
     if not train_cases:
         raise ValueError("train_cases must not be empty")
     if not validation_cases:

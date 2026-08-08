@@ -13,10 +13,7 @@ from backend.generation_context import (
 from backend.generation_guard import GuardedBurstLanguageModel
 from backend.models import ChatMessage
 from backend.persona.cutoff import CutoffLanguageProfile
-from backend.persona.style_fingerprint import (
-    build_burst_behavior_profile,
-    build_style_fingerprint,
-)
+from backend.persona.style_fingerprint import build_burst_behavior_profile, build_style_fingerprint
 from backend.retrieval import HistoricalExample
 from backend.simulation.action_policy import Action
 
@@ -50,12 +47,9 @@ def test_style_fingerprint_is_cutoff_safe_and_relationship_focused() -> None:
         platform="kakao",
         conversation_id="c2",
         context=EvidenceContext.KAKAO_DIRECT,
-        messages=(
-            _emessage(BASE - timedelta(days=1), "target", "안녕하세요...", "c2"),
-        ),
+        messages=(_emessage(BASE - timedelta(days=1), "target", "안녕하세요...", "c2"),),
     )
     evidence = PersonEvidence("target", (c1, c2))
-
     profile = build_style_fingerprint(
         evidence,
         BASE,
@@ -63,7 +57,6 @@ def test_style_fingerprint_is_cutoff_safe_and_relationship_focused() -> None:
         focus_platform="kakao",
         focus_multiplier=3.0,
     )
-
     assert profile.message_count == 3
     assert profile.focused_message_count == 2
     assert profile.repeated_question_ratio is not None
@@ -96,7 +89,6 @@ def test_burst_profile_uses_only_examples_before_cutoff() -> None:
         target_texts=("future",),
         burst_size=1,
     )
-
     profile = build_burst_behavior_profile(
         [old, future],
         BASE,
@@ -104,7 +96,6 @@ def test_burst_profile_uses_only_examples_before_cutoff() -> None:
         platform="kakao",
         action=Action.REPLY,
     )
-
     assert profile.event_count == 1
     assert profile.focused_event_count == 1
     assert profile.weighted_mean_burst_size == 2.0
@@ -177,19 +168,39 @@ def test_copy_guard_retries_long_historical_verbatim_copy() -> None:
         copy_threshold=0.82,
         min_reference_chars=8,
     )
-
     result = model.generate_burst(_packet(reference))
-
     assert result.messages == ("그쪽으로 와 ㅋㅋ",)
     assert len(base.calls) == 2
     assert base.calls[1].generation_directives
-    assert "too close" in base.calls[1].generation_directives[-1]
+    assert "historical" in base.calls[1].generation_directives[-1].lower()
+
+
+def test_copy_guard_final_attempt_removes_raw_historical_wording() -> None:
+    reference = "뚜레쥬르 앞으로 와"
+    base = SequenceModel([reference, reference, "완전 다른 문장"])
+    model = GuardedBurstLanguageModel(
+        base,
+        max_attempts=3,
+        copy_threshold=0.82,
+        min_reference_chars=8,
+    )
+    result = model.generate_burst(_packet(reference))
+    assert result.messages == ("완전 다른 문장",)
+    assert len(base.calls) == 3
+    assert base.calls[2].retrieved_examples[0].response_texts == ()
+    assert "removed" in base.calls[2].generation_directives[-1].lower()
+
+
+def test_copy_guard_detects_reference_embedded_inside_longer_output() -> None:
+    reference = "뚜레쥬르 앞으로 와"
+    base = SequenceModel([f"아 그럼 {reference} ㅋㅋ", "그쪽으로 보자"])
+    model = GuardedBurstLanguageModel(base, max_attempts=2, copy_threshold=0.82)
+    assert model.generate_burst(_packet(reference)).messages == ("그쪽으로 보자",)
 
 
 def test_copy_guard_allows_common_short_repetition() -> None:
     reference = "ㅇㅇ"
     base = SequenceModel([reference])
     model = GuardedBurstLanguageModel(base, max_attempts=2, min_reference_chars=8)
-
     assert model.generate_burst(_packet(reference)).messages == ("ㅇㅇ",)
     assert len(base.calls) == 1

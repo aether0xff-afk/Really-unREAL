@@ -1,126 +1,126 @@
-# Really-unREAL 1.1.0
+# Really-unREAL 1.2.0
 
 A local-first conversation-behavior digital-twin framework grounded in real message history.
 
-Really-unREAL does **not** claim to reconstruct hidden thoughts, feelings, attraction, intent, or a person's mind. It models narrower observable behavior: **when someone stays silent, when they reply or follow up, how timing changes with visible context, how they split messages, and how they write.**
+Really-unREAL does **not** claim to reconstruct hidden thoughts, feelings, attraction, intent, or a person's mind. It models narrower observable behavior: **whether someone stays silent, whether/when they read or reply, whether they follow up or start a new session, how they split messages, and how they write.**
 
 > Make the most plausible behavior from the evidence, not the most entertaining behavior.
 
 ## Quick start — Windows GUI
 
-1. Download `Really-unREAL-v1.1.0-Windows-x64.zip` from the GitHub Release.
+1. Download `Really-unREAL-v1.2.0-Windows-x64.zip` from the GitHub Release.
 2. Extract it and run `Really-unREAL.exe`.
 3. Choose one or many KakaoTalk export ZIP files.
 4. Confirm the suggested **내 이름**.
 5. Choose a direct-chat **대화 상대**.
 6. Run **빠른 진단** to check the imported data without an LLM.
 7. Optionally run **모델 테스트** on held-out historical replies.
-8. Choose Local LLM or NVIDIA NIM and press **대화 시작** for a persistent simulation conversation.
+8. Choose Local LLM or NVIDIA NIM and press **대화 시작**.
 
-The app does not install a background service and never sends a message to KakaoTalk, Instagram, or another real messaging platform.
+The app never sends messages to KakaoTalk, Instagram, or another real messaging platform.
 
-See `docs/QUICKSTART_GUI.md` for the full desktop walkthrough.
+## 1.2 Live behavior model
 
-## Desktop modes
-
-```text
-Kakao ZIP(s)
-   |
-   v
-confirm self -> choose target
-   |
-   +--> 빠른 진단
-   |      parsing / identity / timing health check
-   |      no LLM
-   |
-   +--> 모델 테스트
-   |      hide real historical continuation
-   |      reproduce and measure observable behavior
-   |
-   +--> 대화 시작
-          persistent SIMULATION chat
-          actual clock + WAIT/REPLY/INITIATE
-```
-
-The NVIDIA default of **3 test cases is only a quick smoke check**. For model comparisons, use 10–20+ held-out cases when practical. Really-unREAL reports content overlap, endings, expression behavior, message splitting, and timing separately instead of inventing one identity-fidelity score.
-
-## What 1.1.0 changes
-
-### Provider-independent behavior
-
-A language-model outage no longer changes the simulated person's behavioral decision.
+1.2 fixes the main structural limitation of 1.1: a user message no longer implies that a reply must eventually exist.
 
 ```text
-behavior model schedules REPLY at T
-             |
-             +--> provider success -> generated message
-             |
-             +--> 429 / 5xx / timeout
-                    behavior time T stays unchanged
-                    generation retries on a separate delivery clock
+current observable context
+        |
+        v
+   REPLY or WAIT?  ---------------------- WAIT -> silence
+        |
+      REPLY
+        |
+        +---- inferred READ event (no LLM)
+        |
+        +---- reply timing
+        v
+   generation only when due
+        |
+        v
+  FOLLOW_UP / INITIATE / WAIT
 ```
 
-Permanent provider/configuration failures preserve the behavior as blocked until generation is explicitly retried. A provider retry cannot read conversation context that arrived after the original modeled behavior time merely because the provider was unavailable.
+The runtime now distinguishes:
 
-### Context-conditioned stochastic timing
+- `WAIT` — no message behavior is scheduled;
+- `READ` — simulation-only inferred read state, never a real Kakao receipt;
+- `REPLY` — response to the counterpart;
+- `FOLLOW_UP` — another target message inside an active session;
+- `INITIATE` — a new-session start after a long idle gap.
 
-Live timing can condition on observable evidence including:
+### REPLY vs WAIT
 
-- current direct relationship;
-- REPLY vs INITIATE;
-- time of day;
-- weekday/weekend;
-- recent 15-minute conversation activity;
+A relationship-specific binary behavior policy is fitted from complete historical counterpart-message bursts. Cases where the counterpart sends another burst before the target answers provide conservative silence/WAIT evidence. The final export edge is treated as censored rather than automatically labeled as an ignore.
+
+### READ is separate from REPLY
+
+Kakao exports do not contain ground-truth read timestamps. 1.2 therefore keeps READ explicitly labeled as **SIMULATION inference** and schedules it separately from REPLY. A message can show `읽음 추정` before the modeled reply arrives. Provider outages cannot move an already-modeled read/reply behavior time.
+
+### FOLLOW_UP is not INITIATE
+
+1.1 used same-sender continuation as an initiation proxy. 1.2 separates same-session `FOLLOW_UP` from a long-gap new-session `INITIATE`. Long-gap target messages after the counterpart remain action-role ambiguous instead of being force-labeled.
+
+## Timing
+
+Live timing can use observable context including:
+
+- relationship and action role;
+- time of day and weekday/weekend;
+- recent 15-minute activity;
 - previous visible-message gap;
-- question / very-short / statement message type when enough relationship evidence exists.
+- **time since the last visible message**;
+- question / very-short / statement type, including common Korean questions without `?`.
 
-The richer discrete hazard model is deployed only when it improves held-out validation. Sparse histories use contextual empirical backoff. Kakao same-minute observations remain timing intervals rather than fake exact seconds.
+The richer discrete hazard model is used only when held-out validation earns it. A tiny empirical cell no longer overrides a validated hazard model. Sparse histories back off conservatively.
 
-### Stronger person-specific generation
+Kakao minute timestamps remain feasible intervals rather than fake exact seconds.
 
-```text
-current visible conversation       -> WHAT must be answered
-relationship style fingerprint     -> HOW this person tends to write
-burst profile                      -> bubble count / amount of text
-cutoff-safe topic/event memory     -> continuity
-historical situation retrieval     -> similar observed contexts
-<=2 older REAL style exemplars     -> phrasing/rhythm evidence in Live mode
-anti-copy guard                    -> regenerate suspicious long reuse
-```
+## User and target message bursts
 
-Short common expressions such as `ㅇㅇ`, `ㄴㄴ`, or `ㅋㅋ` may naturally recur. Long near-verbatim reuse of a historical style exemplar triggers another independently worded generation attempt.
+Rapid user bubbles no longer re-sample and reset the reply clock on every press of Send. A pending unclaimed reply keeps its sampled behavior time, with only a small input-settle floor to avoid firing mid-typing.
 
-Historical Replay/model-test paths keep raw historical response exemplars disabled by default.
+Generated multi-bubble replies no longer use a fake fixed `+1 second` spacing. Internal burst gaps are sampled from observed REAL target bursts when available.
 
-## Core architecture
+## Race/crash safety
 
-A normal persona chatbot is roughly:
+SQLite dispatch now uses an explicit event lifecycle:
 
 ```text
-history -> RAG -> LLM -> message
+PENDING / RETRY
+      |
+      v
+   CLAIMED  <--- atomic claim; another window/process cannot claim it
+      |
+      +-- provider temporary failure -> RETRY
+      +-- permanent/config error ----> BLOCKED
+      +-- success -------------------> message insert + PROCESSED atomically
 ```
 
-Really-unREAL separates behavior from prose:
+- provider retry time remains separate from immutable modeled behavior time;
+- a later user message cannot cancel an already claimed generation;
+- retries cannot see context after the original modeled behavior cutoff;
+- stale claims are recovered after restart;
+- resetting a chat while generation is in flight prevents stale output from reappearing;
+- generated messages and event completion are committed in one transaction.
 
-```text
-real clock
-   |
-   v
-WAIT / REPLY / INITIATE
-   |
-   +---- WAIT ----------------------> nothing happens
-   |
-   v
-cutoff-safe persona + memory + retrieval
-   |
-   v
-language model
-   |
-   v
-SIMULATION memory
-```
+## Person-specific generation
 
-The LLM never gets to talk merely because the app is running.
+Generation combines current visible conversation, relationship-focused style fingerprint, burst profile, cutoff-safe topic/event memory, historical-situation retrieval, and at most two older REAL style exemplars in Live mode.
+
+The anti-copy guard now checks both whole-output similarity and historical-phrase containment. If repeated generation remains too close to an old long exemplar, the final attempt removes raw historical response wording entirely and generates from style/structure evidence only. Common short expressions such as `ㅇㅇ`, `ㄴㄴ`, or `ㅋㅋ` may still recur naturally.
+
+## Evaluation
+
+Historical Replay remains chronological and future-leakage-safe. Timing evaluation is now independent of provider generation success: an NVIDIA/local failure cannot silently remove a timing case from the metric.
+
+For uncertainty:
+
+- mean-like content metrics use Student-t intervals for small samples;
+- binary match rates use Wilson intervals;
+- the default NVIDIA 3-case run remains a smoke check, not a fidelity estimate.
+
+Use 10–20+ held-out cases for comparisons when practical.
 
 ## Privacy model
 
@@ -134,68 +134,19 @@ SIMULATION  generated events and user-entered simulation messages
 - Loopback model endpoints are local by default.
 - Non-loopback private-context transmission requires explicit consent.
 - API keys are not written to evaluation JSON or release artifacts.
-- Live style exemplars are private prompt-time evidence and are not written into public result JSON, CI status, or release assets.
+- Live style exemplars are private prompt-time evidence.
 - No real messaging-platform send API exists in the core.
-
-## Historical Replay
-
-Replay hides a real continuation and asks the system to reproduce behavior using only older evidence.
-
-```text
-visible past
-    |
-    +---- cutoff
-            |
-           WAIT / REPLY / INITIATE timing
-            |
-            +---- held-out real event
-                    timing interval
-                    burst shape
-                    hidden content used only after generation for evaluation
-```
-
-Train/validation/test are chronological, not random. Persona, retrieval, style fingerprints, topics, events, and optional Live style exemplars all obey temporal cutoff barriers.
-
-## Main capabilities
-
-- KakaoTalk text/ZIP ingestion and multi-ZIP GUI selection.
-- Meta/Instagram ingestion and source-aware fusion for advanced workflows.
-- Conservative identity mapping.
-- PERSON and SELF twin replay datasets.
-- Leakage-safe chronological Historical Replay.
-- Interval-aware Kakao timing.
-- Relationship empirical timing + validation-gated discrete hazard model.
-- Context-conditioned stochastic live timing.
-- Relationship-focused language/style and burst profiles.
-- Topic/event memory and historical-situation retrieval.
-- Anti-copy guarded Live style exemplars.
-- NVIDIA NIM and OpenAI-compatible local generation adapters.
-- Closed-loop Shadow Simulation baseline.
-- Persistent SQLite live runtime with provider retry recovery.
-- Strict REAL/SIMULATION separation.
+- `읽음 추정` is a simulation state, not a real read receipt.
 
 ## Important limits
 
-- Human communication is stochastic; replay similarity is not proof of identity reconstruction.
-- The base LLM remains a **general language model conditioned by person-specific observable evidence**. v1.1.0 does not claim a neural fine-tune into a real person.
-- INITIATE is intrinsically harder than REPLY because unseen future events cannot be inferred from nowhere.
+- Human communication is stochastic; replay similarity is not identity reconstruction.
+- The base LLM is still a general language model conditioned by person-specific observable evidence, not a neural fine-tune into a real person.
+- Read timing is latent/inferred because exports do not provide true read receipts.
+- True new-session initiations are sparse and harder to model than replies.
 - Sparse relationships require broader statistical backoff.
-- Kakao exports cannot reveal exact second-level timing.
-- Hosted inference still depends on provider availability even though outages no longer alter modeled behavior decisions.
+- Hosted inference still depends on provider availability, though outages no longer alter modeled behavior decisions.
 - Windows portable binaries are unsigned community builds, so SmartScreen may warn.
-
-## Advanced workflows
-
-The CLI remains available for cross-platform identity fusion, SELF twin experiments, dense retrieval ablations, custom identity maps, Historical Replay audits, replay generation benchmarks, and Shadow Simulation.
-
-Relevant docs:
-
-- `docs/QUICKSTART_GUI.md`
-- `docs/HISTORICAL_REPLAY.md`
-- `docs/TEMPORAL_HAZARD.md`
-- `docs/CUTOFF_RAG.md`
-- `docs/SELF_TWIN.md`
-- `docs/V1_0.md`
 
 ## Build from source
 
@@ -208,12 +159,19 @@ pyinstaller --noconfirm --clean --onefile --windowed --name Really-unREAL backen
 ./dist/Really-unREAL.exe --smoke
 ```
 
-Official release workflows run tests, integrated runtime imports, PyInstaller, the packaged EXE smoke path, and release packaging before publication.
+Relevant docs:
 
-## 1.1 development train
+- `docs/QUICKSTART_GUI.md`
+- `docs/HISTORICAL_REPLAY.md`
+- `docs/TEMPORAL_HAZARD.md`
+- `docs/CUTOFF_RAG.md`
+- `docs/SELF_TWIN.md`
 
-- `v1.1.0-dev.1` — provider failure resilience
-- `v1.1.0-dev.2` — context-conditioned timing
-- `v1.1.0-dev.3` — stronger person-specific generation + anti-copy
-- `v1.1.0-rc.1` — integration / behavior-vs-delivery clock separation / evaluation uncertainty
-- **`v1.1.0` — final release**
+## Release history
+
+- 1.0 — leakage-safe Historical Replay foundation
+- 1.0.4 — persistent desktop Live Simulation
+- 1.0.5 — stochastic observed timing instead of fixed median
+- 1.1 — provider resilience, context timing, stronger person-specific generation
+- 1.1.1 — inferred read/unread UI
+- **1.2.0 — true WAIT, READ/REPLY/FOLLOW_UP/INITIATE separation, burst handling, atomic event runtime, evaluation/anti-copy hardening**

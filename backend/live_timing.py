@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import random
+import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Iterable, Sequence
@@ -8,7 +9,31 @@ from typing import Iterable, Sequence
 from backend.fusion import EvidenceMessage
 from backend.replay import ReplayCase, chronological_split
 from backend.replay_hazard import DiscreteHazardModel, select_temporal_model
-from backend.simulation.action_policy import Action
+from backend.simulation.action_policy import Action, MESSAGE_ACTIONS
+
+
+_INTERROGATIVE_RE = re.compile(
+    r"(^|\s)(뭐|왜|언제|어디|누구|누가|몇|어떻게|어케|얼마|어느)(\s|$)"
+)
+_QUESTION_STEMS = (
+    "뭐함",
+    "뭐해",
+    "뭐하",
+    "몇시",
+    "몇명",
+    "몇개",
+    "어디감",
+    "어디가",
+    "언제감",
+    "언제와",
+    "어떻게",
+    "어케",
+    "얼마",
+    "가능함",
+    "가능해",
+    "맞음",
+    "맞아",
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -17,7 +42,22 @@ class LiveTimingFeatures:
     weekend: int
     recent_activity: str
     previous_gap: str
+    since_last: str
     last_message_kind: str
+
+
+def classify_message_kind(text: str) -> str:
+    text = text.strip()
+    compact = "".join(text.split())
+    if (
+        "?" in text
+        or _INTERROGATIVE_RE.search(text)
+        or any(stem in compact for stem in _QUESTION_STEMS)
+    ):
+        return "question"
+    if len(compact) <= 4:
+        return "very_short"
+    return "statement"
 
 
 def _activity_bucket(count: int) -> str:
@@ -44,36 +84,52 @@ def _gap_bucket(seconds: float | None) -> str:
     return ">2h"
 
 
-def _message_kind(context: Sequence[EvidenceMessage]) -> str:
-    if not context:
-        return "none"
-    text = context[-1].message.text.strip()
-    if "?" in text:
-        return "question"
-    compact = "".join(text.split())
-    if len(compact) <= 4:
-        return "very_short"
-    return "statement"
+def _since_last_bucket(seconds: float | None) -> str:
+    if seconds is None:
+        return "unknown"
+    if seconds <= 60:
+        return "<=1m"
+    if seconds <= 300:
+        return "<=5m"
+    if seconds <= 1800:
+        return "<=30m"
+    if seconds <= 7200:
+        return "<=2h"
+    if seconds <= 21600:
+        return "<=6h"
+    if seconds <= 86400:
+        return "<=1d"
+    if seconds <= 604800:
+        return "<=7d"
+    return ">7d"
 
 
 def visible_timing_features(
     observed_at: datetime,
     context: Sequence[EvidenceMessage],
 ) -> LiveTimingFeatures:
+    visible = sorted(
+        (item for item in context if item.message.timestamp <= observed_at),
+        key=lambda item: item.message.timestamp,
+    )
     cutoff = observed_at - timedelta(minutes=15)
-    recent = sum(cutoff <= item.message.timestamp <= observed_at for item in context)
+    recent = sum(cutoff <= item.message.timestamp <= observed_at for item in visible)
     previous_gap: float | None = None
-    if len(context) >= 2:
+    since_last: float | None = None
+    if visible:
+        since_last = max(0.0, (observed_at - visible[-1].message.timestamp).total_seconds())
+    if len(visible) >= 2:
         previous_gap = max(
             0.0,
-            (context[-1].message.timestamp - context[-2].message.timestamp).total_seconds(),
+            (visible[-1].message.timestamp - visible[-2].message.timestamp).total_seconds(),
         )
     return LiveTimingFeatures(
         hour_band=observed_at.hour // 4,
         weekend=int(observed_at.weekday() >= 5),
         recent_activity=_activity_bucket(recent),
         previous_gap=_gap_bucket(previous_gap),
-        last_message_kind=_message_kind(context),
+        since_last=_since_last_bucket(since_last),
+        last_message_kind=(classify_message_kind(visible[-1].message.text) if visible else "none"),
     )
 
 
@@ -81,23 +137,38 @@ def _historical_features(case: ReplayCase) -> LiveTimingFeatures:
     return visible_timing_features(case.observation_end, case.context)
 
 
-def _observable_action(case: ReplayCase) -> Action:
-    if not case.context:
-        return case.action
-    return (
-        Action.INITIATE
-        if case.context[-1].sender_person_id == case.person_id
-        else Action.REPLY
-    )
+class BurstGapSampler:
+    """Sample within-burst bubble spacing from REAL target bursts."""
+
+    def __init__(self, cases: Iterable[ReplayCase], *, seed: int | None = None) -> None:
+        self._rng = random.Random(seed)
+        self._by_conversation: dict[str, list[float]] = {}
+        self._all: list[float] = []
+        for case in cases:
+            previous = None
+            for item in case.target_burst:
+                if previous is not None:
+                    gap = max(0.0, (item.message.timestamp - previous).total_seconds())
+                    if gap <= 120.0:
+                        self._by_conversation.setdefault(case.conversation_id, []).append(gap)
+                        self._all.append(gap)
+                previous = item.message.timestamp
+
+    def sample_gaps(self, *, conversation_id: str, count: int) -> tuple[float, ...]:
+        if count <= 1:
+            return ()
+        pool = self._by_conversation.get(conversation_id) or self._all
+        if not pool:
+            return tuple(0.0 for _ in range(count - 1))
+        return tuple(float(self._rng.choice(pool)) for _ in range(count - 1))
 
 
 class ContextualLiveTimingSampler:
-    """Deploy live timing from observable current context with safe backoff.
+    """Context-aware live timing with validation-gated hazard deployment.
 
-    Fine-grained empirical cells can condition on the visible message itself
-    (question / very short / statement) when at least a few matching historical
-    events exist. Otherwise the policy uses the validation-gated discrete hazard
-    model, then progressively broader relationship/action empirical backoff.
+    A validated hazard model gets first priority. Empirical context cells are used
+    only when the richer model did not earn deployment, and fine cells require a
+    minimum support floor instead of letting n=3 override validation evidence.
     """
 
     def __init__(
@@ -106,13 +177,13 @@ class ContextualLiveTimingSampler:
         *,
         person_id: str,
         seed: int | None = None,
-        minimum_context_events: int = 3,
+        minimum_context_events: int = 5,
     ) -> None:
         self.cases = tuple(cases)
         if not self.cases:
             raise ValueError("cannot build contextual live timing without replay cases")
         self.person_id = person_id
-        self.minimum_context_events = max(1, int(minimum_context_events))
+        self.minimum_context_events = max(3, int(minimum_context_events))
         self._rng = random.Random(seed)
         self._hazard: DiscreteHazardModel | None = None
         self.selection_reason = "contextual empirical backoff"
@@ -138,6 +209,9 @@ class ContextualLiveTimingSampler:
     def model_name(self) -> str:
         return "hazard" if self._hazard is not None else "contextual_empirical"
 
+    def has_action_evidence(self, action: Action) -> bool:
+        return bool(self._confident_action_cases(action))
+
     def _sample_case(self, cases: Sequence[ReplayCase]) -> float:
         weights = [max(0.0, float(case.evidence_weight)) for case in cases]
         if not any(weights):
@@ -151,26 +225,24 @@ class ContextualLiveTimingSampler:
         return [
             case
             for case in self.cases
-            if not case.action_is_ambiguous
-            and _observable_action(case) == action
+            if not case.action_is_ambiguous and case.action == action
         ]
 
-    def _exact_context_candidates(
+    def _action_is_valid(
         self,
-        *,
-        conversation_id: str,
         action: Action,
-        observed_at: datetime,
         visible_context: Sequence[EvidenceMessage],
-    ) -> list[ReplayCase]:
-        live = visible_timing_features(observed_at, visible_context)
-        pool = [
-            case
-            for case in self._confident_action_cases(action)
-            if case.conversation_id == conversation_id
-            and _historical_features(case) == live
-        ]
-        return pool if len(pool) >= self.minimum_context_events else []
+    ) -> bool:
+        if action not in MESSAGE_ACTIONS:
+            return False
+        if not visible_context:
+            return action == Action.INITIATE
+        last_sender = visible_context[-1].sender_person_id
+        if action == Action.REPLY:
+            return last_sender != self.person_id
+        if action in {Action.FOLLOW_UP, Action.INITIATE}:
+            return last_sender == self.person_id
+        return False
 
     def _contextual_candidates(
         self,
@@ -192,16 +264,14 @@ class ContextualLiveTimingSampler:
         levels = [
             [
                 case for case in confident
-                if case.conversation_id == conversation_id
-                and feat(case).hour_band == live.hour_band
-                and feat(case).recent_activity == live.recent_activity
-                and feat(case).previous_gap == live.previous_gap
-                and feat(case).last_message_kind == live.last_message_kind
+                if case.conversation_id == conversation_id and feat(case) == live
             ],
             [
                 case for case in confident
                 if case.conversation_id == conversation_id
+                and feat(case).hour_band == live.hour_band
                 and feat(case).recent_activity == live.recent_activity
+                and feat(case).since_last == live.since_last
                 and feat(case).last_message_kind == live.last_message_kind
             ],
             [
@@ -214,14 +284,15 @@ class ContextualLiveTimingSampler:
                 case for case in confident
                 if case.platform == platform
                 and feat(case).hour_band == live.hour_band
-                and feat(case).recent_activity == live.recent_activity
                 and feat(case).last_message_kind == live.last_message_kind
             ],
             [case for case in confident if case.platform == platform],
             confident,
         ]
         for index, pool in enumerate(levels):
-            if pool and (index >= 3 or len(pool) >= self.minimum_context_events):
+            if not pool:
+                continue
+            if index >= 3 or len(pool) >= self.minimum_context_events:
                 return pool
         return []
 
@@ -235,12 +306,7 @@ class ContextualLiveTimingSampler:
         visible_context: Sequence[EvidenceMessage],
     ) -> ReplayCase | None:
         context = tuple(visible_context)
-        if not context:
-            return None
-        last_sender = context[-1].sender_person_id
-        if action == Action.REPLY and last_sender == self.person_id:
-            return None
-        if action == Action.INITIATE and last_sender != self.person_id:
+        if not context or not self._action_is_valid(action, context):
             return None
         return ReplayCase(
             case_id=f"live-timing:{conversation_id}:{observed_at.isoformat()}:{action.value}",
@@ -258,7 +324,7 @@ class ContextualLiveTimingSampler:
             context=context,
             target_burst=(),
             burst_size=0,
-            session_restart=False,
+            session_restart=(action == Action.INITIATE),
             action_is_ambiguous=False,
         )
 
@@ -271,20 +337,14 @@ class ContextualLiveTimingSampler:
         observed_at: datetime | None = None,
         visible_context: Sequence[EvidenceMessage] = (),
     ) -> float | None:
-        if action == Action.WAIT:
+        if action in {Action.WAIT, Action.READ}:
             return None
-        observed_at = observed_at or datetime.now()
+        if not self._action_is_valid(action, visible_context):
+            return None
+        if not self._confident_action_cases(action):
+            return None
 
-        # If the same relationship has enough exact observable-context evidence,
-        # use it directly. This is where question-vs-statement timing can matter.
-        exact = self._exact_context_candidates(
-            conversation_id=conversation_id,
-            action=action,
-            observed_at=observed_at,
-            visible_context=visible_context,
-        )
-        if exact:
-            return self._sample_case(exact)
+        observed_at = observed_at or datetime.now()
 
         if self._hazard is not None:
             live_case = self._live_case(
@@ -295,13 +355,11 @@ class ContextualLiveTimingSampler:
                 visible_context=visible_context,
             )
             if live_case is not None:
-                return max(
-                    0.0,
-                    self._hazard.sample_delay_seconds(
-                        live_case,
-                        seed=self._rng.randrange(0, 2**32),
-                    ),
+                sampled = self._hazard.sample_delay_seconds(
+                    live_case,
+                    seed=self._rng.randrange(0, 2**32),
                 )
+                return None if sampled is None else max(0.0, float(sampled))
 
         candidates = self._contextual_candidates(
             platform=platform,

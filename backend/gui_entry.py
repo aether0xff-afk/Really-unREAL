@@ -7,7 +7,7 @@ from backend import __version__
 
 
 def bundle_smoke() -> None:
-    """Verify resources that must survive PyInstaller bundling."""
+    """Verify resources and 1.2 runtime modules survive PyInstaller bundling."""
 
     ZoneInfo("UTC")
     ZoneInfo("Asia/Seoul")
@@ -16,7 +16,10 @@ def bundle_smoke() -> None:
     import backend.gui_live  # noqa: F401
     import backend.gui_chat_window  # noqa: F401
     import backend.gui_responsive  # noqa: F401
+    import backend.live_behavior  # noqa: F401
     import backend.live_timing  # noqa: F401
+    import backend.simulation.store  # noqa: F401
+    import backend.simulation.runtime  # noqa: F401
     import backend.generation_guard  # noqa: F401
     import backend.persona.style_fingerprint  # noqa: F401
     import backend.providers.errors  # noqa: F401

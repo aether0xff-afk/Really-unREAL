@@ -22,7 +22,7 @@ def _ngrams(text: str, n: int = 3) -> set[str]:
 
 
 def text_copy_similarity(left: str, right: str) -> float:
-    """Character 3-gram Jaccard used only as an anti-copy safety heuristic."""
+    """Detect both overall near-copy and a historical phrase embedded in output."""
 
     left_set = _ngrams(left)
     right_set = _ngrams(right)
@@ -30,7 +30,10 @@ def text_copy_similarity(left: str, right: str) -> float:
         return 1.0
     if not left_set or not right_set:
         return 0.0
-    return len(left_set & right_set) / len(left_set | right_set)
+    overlap = len(left_set & right_set)
+    jaccard = overlap / len(left_set | right_set)
+    containment = overlap / min(len(left_set), len(right_set))
+    return max(jaccard, containment)
 
 
 def historical_style_references(
@@ -41,8 +44,7 @@ def historical_style_references(
     references: list[str] = []
     for example in packet.retrieved_examples:
         for text in example.response_texts:
-            normalized = _normalize(text)
-            if len(normalized) >= min_reference_chars:
+            if len(_normalize(text)) >= min_reference_chars:
                 references.append(text)
     return tuple(references)
 
@@ -56,23 +58,30 @@ def max_historical_copy_similarity(
     return max(values, default=0.0)
 
 
-class GuardedBurstLanguageModel:
-    """Retry suspicious long exemplar copies while preserving ordinary phrasing.
+def _without_raw_exemplars(packet: GenerationContextPacket) -> GenerationContextPacket:
+    examples = tuple(
+        replace(example, response_texts=()) for example in packet.retrieved_examples
+    )
+    return replace(
+        packet,
+        retrieved_examples=examples,
+        generation_directives=packet.generation_directives
+        + (
+            "Historical response wording has been removed for this attempt. "
+            "Use only the style fingerprint, burst profile and current visible context; "
+            "compose the response independently.",
+        ),
+    )
 
-    Very short historical replies are deliberately excluded from copy detection:
-    expressions such as `ㅇㅇ`, `ㄴㄴ`, `오케`, or `ㅋㅋ` are legitimate recurring
-    observable habits and should not be treated as memorization. Longer style
-    exemplars may be shown to the provider, but near-verbatim reproduction causes
-    a retry with an explicit rewrite directive. If every candidate remains close,
-    the least-copying candidate is returned instead of erasing the scheduled
-    behavior.
-    """
+
+class GuardedBurstLanguageModel:
+    """Regenerate suspicious exemplar reuse and fall back without raw wording."""
 
     def __init__(
         self,
         base_model: BurstLanguageModel,
         *,
-        max_attempts: int = 2,
+        max_attempts: int = 3,
         copy_threshold: float = 0.82,
         min_reference_chars: int = 8,
     ) -> None:
@@ -101,6 +110,7 @@ class GuardedBurstLanguageModel:
 
         candidates: list[tuple[float, GeneratedBurst]] = []
         current_packet = packet
+        stripped = False
         for attempt in range(self.max_attempts):
             burst = self.base_model.generate_burst(current_packet)
             similarity = max_historical_copy_similarity(burst, references)
@@ -108,17 +118,26 @@ class GuardedBurstLanguageModel:
             if similarity < self.copy_threshold:
                 return burst
 
-            if attempt + 1 < self.max_attempts:
+            if attempt + 1 >= self.max_attempts:
+                break
+            if attempt + 2 == self.max_attempts:
+                # Final attempt removes the raw historical wording entirely, so
+                # the guard is not merely asking the same prompt to "try harder".
+                current_packet = _without_raw_exemplars(packet)
+                stripped = True
+            else:
                 current_packet = replace(
                     packet,
                     generation_directives=packet.generation_directives
                     + (
-                        "The previous candidate was too close to an older style exemplar. "
-                        "Answer the CURRENT visible message again in this person's style, "
-                        "but use independently composed wording and do not reuse a long "
-                        "historical phrase.",
+                        "The previous candidate reused too much historical wording. "
+                        "Answer the CURRENT visible message again in this person's style "
+                        "with independently composed phrasing.",
                     ),
                 )
 
+        # A provider can still independently emit the same phrase after exemplars
+        # are removed. Preserve the scheduled behavior but return the least-copying
+        # candidate rather than silently deleting the event.
         candidates.sort(key=lambda item: item[0])
         return candidates[0][1]

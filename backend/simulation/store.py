@@ -4,7 +4,7 @@ import json
 import sqlite3
 import uuid
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Iterable
 
@@ -12,7 +12,8 @@ from backend.models import ChatMessage, MemorySource, MessageType
 from backend.simulation.action_policy import Action
 
 
-_ACTIVE_STATUSES = ("PENDING", "RETRY", "BLOCKED")
+_ACTIVE_STATUSES = ("PENDING", "RETRY", "BLOCKED", "CLAIMED")
+_CANCELLABLE_STATUSES = ("PENDING", "RETRY", "BLOCKED")
 _DUE_STATUSES = ("PENDING", "RETRY")
 
 
@@ -23,30 +24,22 @@ class ScheduledEvent:
     platform: str
     conversation_id: str
     action: Action
-    # due_at is the simulated person's behavior time and is immutable after
-    # scheduling. Provider retries must never rewrite it.
     due_at: datetime
     created_at: datetime
     status: str
     generation_attempts: int = 0
     last_error: str | None = None
     next_attempt_at: datetime | None = None
+    claim_token: str | None = None
+    claimed_at: datetime | None = None
 
     @property
     def ready_at(self) -> datetime:
-        """Clock time when generation may next be attempted."""
-
         return self.next_attempt_at or self.due_at
 
 
 class SQLiteSimulationStore:
-    """Durable local state for live/shadow simulation.
-
-    `due_at` represents observable simulated behavior. `next_attempt_at` is only
-    provider-delivery bookkeeping. Read receipts are also simulation state: they
-    describe what the model inferred happened inside the simulation and never
-    claim to be real KakaoTalk read receipts.
-    """
+    """Durable local state with atomic event claiming and completion."""
 
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path)
@@ -54,7 +47,7 @@ class SQLiteSimulationStore:
         self._initialize()
 
     def _connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self.path)
+        connection = sqlite3.connect(self.path, timeout=30.0)
         connection.row_factory = sqlite3.Row
         return connection
 
@@ -78,7 +71,9 @@ class SQLiteSimulationStore:
                     status TEXT NOT NULL DEFAULT 'PENDING',
                     generation_attempts INTEGER NOT NULL DEFAULT 0,
                     last_error TEXT,
-                    next_attempt_at TEXT
+                    next_attempt_at TEXT,
+                    claim_token TEXT,
+                    claimed_at TEXT
                 );
                 CREATE INDEX IF NOT EXISTS idx_scheduled_due
                     ON scheduled_events(status, due_at);
@@ -101,20 +96,23 @@ class SQLiteSimulationStore:
                 row["name"]
                 for row in db.execute("PRAGMA table_info(scheduled_events)").fetchall()
             }
-            if "generation_attempts" not in columns:
-                db.execute(
-                    "ALTER TABLE scheduled_events ADD COLUMN generation_attempts "
-                    "INTEGER NOT NULL DEFAULT 0"
-                )
-            if "last_error" not in columns:
-                db.execute("ALTER TABLE scheduled_events ADD COLUMN last_error TEXT")
-            if "next_attempt_at" not in columns:
-                db.execute("ALTER TABLE scheduled_events ADD COLUMN next_attempt_at TEXT")
+            migrations = {
+                "generation_attempts": "INTEGER NOT NULL DEFAULT 0",
+                "last_error": "TEXT",
+                "next_attempt_at": "TEXT",
+                "claim_token": "TEXT",
+                "claimed_at": "TEXT",
+            }
+            for name, declaration in migrations.items():
+                if name not in columns:
+                    db.execute(
+                        f"ALTER TABLE scheduled_events ADD COLUMN {name} {declaration}"
+                    )
 
     def set_last_processed(self, timestamp: datetime) -> None:
         with self._connect() as db:
             db.execute(
-                "INSERT INTO simulation_state(key, value) VALUES('last_processed', ?) "
+                "INSERT INTO simulation_state(key,value) VALUES('last_processed',?) "
                 "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                 (timestamp.isoformat(),),
             )
@@ -142,7 +140,7 @@ class SQLiteSimulationStore:
         event_id = uuid.uuid4().hex
         with self._connect() as db:
             if replace_same_action:
-                placeholders = ",".join("?" for _ in _ACTIVE_STATUSES)
+                placeholders = ",".join("?" for _ in _CANCELLABLE_STATUSES)
                 db.execute(
                     "UPDATE scheduled_events SET status='CANCELLED' "
                     "WHERE twin_person_id=? AND platform=? AND conversation_id=? "
@@ -152,14 +150,14 @@ class SQLiteSimulationStore:
                         platform,
                         conversation_id,
                         action.value,
-                        *_ACTIVE_STATUSES,
+                        *_CANCELLABLE_STATUSES,
                     ),
                 )
             db.execute(
                 "INSERT INTO scheduled_events("
                 "event_id,twin_person_id,platform,conversation_id,action,due_at,created_at,"
-                "status,generation_attempts,last_error,next_attempt_at"
-                ") VALUES(?,?,?,?,?,?,?,'PENDING',0,NULL,NULL)",
+                "status,generation_attempts,last_error,next_attempt_at,claim_token,claimed_at"
+                ") VALUES(?,?,?,?,?,?,?,'PENDING',0,NULL,NULL,NULL,NULL)",
                 (
                     event_id,
                     twin_person_id,
@@ -181,19 +179,25 @@ class SQLiteSimulationStore:
             status="PENDING",
         )
 
-    def cancel_pending(
+    def event(self, event_id: str) -> ScheduledEvent | None:
+        with self._connect() as db:
+            row = db.execute(
+                "SELECT * FROM scheduled_events WHERE event_id=?", (event_id,)
+            ).fetchone()
+        return self._scheduled_from_row(row) if row else None
+
+    def active_events(
         self,
         *,
         twin_person_id: str,
         platform: str,
         conversation_id: str,
         action: Action | None = None,
-    ) -> int:
+    ) -> list[ScheduledEvent]:
         placeholders = ",".join("?" for _ in _ACTIVE_STATUSES)
         query = (
-            "UPDATE scheduled_events SET status='CANCELLED' "
-            "WHERE twin_person_id=? AND platform=? AND conversation_id=? "
-            f"AND status IN ({placeholders})"
+            "SELECT * FROM scheduled_events WHERE twin_person_id=? AND platform=? "
+            f"AND conversation_id=? AND status IN ({placeholders})"
         )
         params: list[object] = [
             twin_person_id,
@@ -204,9 +208,54 @@ class SQLiteSimulationStore:
         if action is not None:
             query += " AND action=?"
             params.append(action.value)
+        query += " ORDER BY COALESCE(next_attempt_at,due_at),event_id"
+        with self._connect() as db:
+            rows = db.execute(query, tuple(params)).fetchall()
+        return [self._scheduled_from_row(row) for row in rows]
+
+    def cancel_pending(
+        self,
+        *,
+        twin_person_id: str,
+        platform: str,
+        conversation_id: str,
+        action: Action | None = None,
+        include_claimed: bool = False,
+    ) -> int:
+        statuses = _ACTIVE_STATUSES if include_claimed else _CANCELLABLE_STATUSES
+        placeholders = ",".join("?" for _ in statuses)
+        query = (
+            "UPDATE scheduled_events SET status='CANCELLED',claim_token=NULL,claimed_at=NULL "
+            "WHERE twin_person_id=? AND platform=? AND conversation_id=? "
+            f"AND status IN ({placeholders})"
+        )
+        params: list[object] = [twin_person_id, platform, conversation_id, *statuses]
+        if action is not None:
+            query += " AND action=?"
+            params.append(action.value)
         with self._connect() as db:
             cursor = db.execute(query, tuple(params))
             return int(cursor.rowcount)
+
+    def postpone_pending_event(self, event_id: str, *, not_before: datetime) -> ScheduledEvent:
+        """Extend an unclaimed behavior while a user input burst is still forming."""
+
+        with self._connect() as db:
+            row = db.execute(
+                "SELECT * FROM scheduled_events WHERE event_id=?", (event_id,)
+            ).fetchone()
+            if row is None or row["status"] != "PENDING":
+                raise KeyError(f"pending event not found: {event_id}")
+            current_due = datetime.fromisoformat(row["due_at"])
+            if not_before > current_due:
+                db.execute(
+                    "UPDATE scheduled_events SET due_at=? WHERE event_id=? AND status='PENDING'",
+                    (not_before.isoformat(), event_id),
+                )
+            updated = db.execute(
+                "SELECT * FROM scheduled_events WHERE event_id=?", (event_id,)
+            ).fetchone()
+        return self._scheduled_from_row(updated)
 
     def due_events(self, now: datetime) -> list[ScheduledEvent]:
         placeholders = ",".join("?" for _ in _DUE_STATUSES)
@@ -219,6 +268,64 @@ class SQLiteSimulationStore:
                 (*_DUE_STATUSES, now.isoformat()),
             ).fetchall()
         return [self._scheduled_from_row(row) for row in rows]
+
+    def claim_due_events(
+        self,
+        *,
+        now: datetime,
+        twin_person_id: str,
+        platform: str,
+        conversation_id: str,
+        limit: int = 8,
+    ) -> list[ScheduledEvent]:
+        """Atomically claim due work so another window/process cannot duplicate it."""
+
+        claimed: list[ScheduledEvent] = []
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            rows = db.execute(
+                "SELECT * FROM scheduled_events WHERE twin_person_id=? AND platform=? "
+                "AND conversation_id=? AND status IN ('PENDING','RETRY') "
+                "AND COALESCE(next_attempt_at,due_at)<=? "
+                "ORDER BY COALESCE(next_attempt_at,due_at),event_id LIMIT ?",
+                (
+                    twin_person_id,
+                    platform,
+                    conversation_id,
+                    now.isoformat(),
+                    max(1, int(limit)),
+                ),
+            ).fetchall()
+            for row in rows:
+                token = uuid.uuid4().hex
+                cursor = db.execute(
+                    "UPDATE scheduled_events SET status='CLAIMED',claim_token=?,claimed_at=? "
+                    "WHERE event_id=? AND status IN ('PENDING','RETRY')",
+                    (token, now.isoformat(), row["event_id"]),
+                )
+                if cursor.rowcount != 1:
+                    continue
+                updated = db.execute(
+                    "SELECT * FROM scheduled_events WHERE event_id=?", (row["event_id"],)
+                ).fetchone()
+                claimed.append(self._scheduled_from_row(updated))
+        return claimed
+
+    def recover_stale_claims(
+        self,
+        *,
+        now: datetime,
+        stale_after_seconds: float = 300.0,
+    ) -> int:
+        cutoff = now - timedelta(seconds=max(1.0, float(stale_after_seconds)))
+        with self._connect() as db:
+            cursor = db.execute(
+                "UPDATE scheduled_events SET status='RETRY',next_attempt_at=?,claim_token=NULL,"
+                "claimed_at=NULL,last_error=COALESCE(last_error,'stale generation claim recovered') "
+                "WHERE status='CLAIMED' AND claimed_at IS NOT NULL AND claimed_at<=?",
+                (now.isoformat(), cutoff.isoformat()),
+            )
+            return int(cursor.rowcount)
 
     def pending_events(self) -> list[ScheduledEvent]:
         placeholders = ",".join("?" for _ in _ACTIVE_STATUSES)
@@ -240,9 +347,9 @@ class SQLiteSimulationStore:
     ) -> ScheduledEvent:
         with self._connect() as db:
             cursor = db.execute(
-                "UPDATE scheduled_events SET status='RETRY', next_attempt_at=?, "
-                "generation_attempts=generation_attempts+1, last_error=? "
-                "WHERE event_id=? AND status IN ('PENDING','RETRY')",
+                "UPDATE scheduled_events SET status='RETRY',next_attempt_at=?,"
+                "generation_attempts=generation_attempts+1,last_error=?,claim_token=NULL,"
+                "claimed_at=NULL WHERE event_id=? AND status IN ('PENDING','RETRY','CLAIMED')",
                 (retry_at.isoformat(), error[:500], event_id),
             )
             if cursor.rowcount != 1:
@@ -255,9 +362,9 @@ class SQLiteSimulationStore:
     def block_event(self, event_id: str, *, error: str) -> ScheduledEvent:
         with self._connect() as db:
             cursor = db.execute(
-                "UPDATE scheduled_events SET status='BLOCKED', next_attempt_at=NULL, "
-                "generation_attempts=generation_attempts+1, last_error=? "
-                "WHERE event_id=? AND status IN ('PENDING','RETRY')",
+                "UPDATE scheduled_events SET status='BLOCKED',next_attempt_at=NULL,"
+                "generation_attempts=generation_attempts+1,last_error=?,claim_token=NULL,"
+                "claimed_at=NULL WHERE event_id=? AND status IN ('PENDING','RETRY','CLAIMED')",
                 (error[:500], event_id),
             )
             if cursor.rowcount != 1:
@@ -267,16 +374,11 @@ class SQLiteSimulationStore:
             ).fetchone()
         return self._scheduled_from_row(row)
 
-    def retry_blocked_event(
-        self,
-        event_id: str,
-        *,
-        retry_at: datetime,
-    ) -> ScheduledEvent:
+    def retry_blocked_event(self, event_id: str, *, retry_at: datetime) -> ScheduledEvent:
         with self._connect() as db:
             cursor = db.execute(
-                "UPDATE scheduled_events SET status='RETRY', next_attempt_at=?, last_error=NULL "
-                "WHERE event_id=? AND status='BLOCKED'",
+                "UPDATE scheduled_events SET status='RETRY',next_attempt_at=?,last_error=NULL,"
+                "claim_token=NULL,claimed_at=NULL WHERE event_id=? AND status='BLOCKED'",
                 (retry_at.isoformat(), event_id),
             )
             if cursor.rowcount != 1:
@@ -289,12 +391,24 @@ class SQLiteSimulationStore:
     def mark_processed(self, event_id: str) -> None:
         with self._connect() as db:
             cursor = db.execute(
-                "UPDATE scheduled_events SET status='PROCESSED', last_error=NULL, "
-                "next_attempt_at=NULL WHERE event_id=? AND status IN ('PENDING','RETRY')",
+                "UPDATE scheduled_events SET status='PROCESSED',last_error=NULL,"
+                "next_attempt_at=NULL,claim_token=NULL,claimed_at=NULL "
+                "WHERE event_id=? AND status IN ('PENDING','RETRY','CLAIMED')",
                 (event_id,),
             )
             if cursor.rowcount != 1:
-                raise KeyError(f"due scheduled event not found: {event_id}")
+                raise KeyError(f"active scheduled event not found: {event_id}")
+
+    def complete_claimed_event(self, event_id: str) -> None:
+        with self._connect() as db:
+            cursor = db.execute(
+                "UPDATE scheduled_events SET status='PROCESSED',last_error=NULL,"
+                "next_attempt_at=NULL,claim_token=NULL,claimed_at=NULL "
+                "WHERE event_id=? AND status='CLAIMED'",
+                (event_id,),
+            )
+            if cursor.rowcount != 1:
+                raise KeyError(f"claimed event not found: {event_id}")
 
     def append_simulation_messages(
         self,
@@ -330,6 +444,56 @@ class SQLiteSimulationStore:
                 rows,
             )
 
+    def complete_claimed_event_with_messages(
+        self,
+        *,
+        event_id: str,
+        twin_person_id: str,
+        platform: str,
+        conversation_id: str,
+        sender_person_id: str,
+        messages: Iterable[tuple[datetime, str]],
+        metadata: dict[str, object] | None = None,
+    ) -> None:
+        """Insert generated output and mark the claimed event processed atomically."""
+
+        rows = list(messages)
+        encoded_metadata = json.dumps(metadata or {}, ensure_ascii=False)
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            state = db.execute(
+                "SELECT status FROM scheduled_events WHERE event_id=?", (event_id,)
+            ).fetchone()
+            if state is None or state["status"] != "CLAIMED":
+                raise KeyError(f"claimed event not found: {event_id}")
+            if rows:
+                db.executemany(
+                    "INSERT INTO simulation_messages("
+                    "twin_person_id,platform,conversation_id,timestamp,sender_person_id,text,"
+                    "message_type,metadata_json) VALUES(?,?,?,?,?,?,?,?)",
+                    [
+                        (
+                            twin_person_id,
+                            platform,
+                            conversation_id,
+                            timestamp.isoformat(),
+                            sender_person_id,
+                            text,
+                            MessageType.TEXT.value,
+                            encoded_metadata,
+                        )
+                        for timestamp, text in rows
+                    ],
+                )
+            cursor = db.execute(
+                "UPDATE scheduled_events SET status='PROCESSED',last_error=NULL,"
+                "next_attempt_at=NULL,claim_token=NULL,claimed_at=NULL "
+                "WHERE event_id=? AND status='CLAIMED'",
+                (event_id,),
+            )
+            if cursor.rowcount != 1:
+                raise RuntimeError("event claim changed during atomic completion")
+
     def mark_messages_read(
         self,
         *,
@@ -339,14 +503,8 @@ class SQLiteSimulationStore:
         sender_person_id: str,
         read_at: datetime,
         sent_before_or_at: datetime | None = None,
+        source: str = "SIMULATION_LATENT_READ",
     ) -> int:
-        """Mark unread SIMULATION messages as read at a modeled time.
-
-        Read state is stored inside metadata_json to avoid changing the durable
-        message schema. Existing metadata is preserved. The method is idempotent:
-        once a message has a read_at value, retries cannot move that read time.
-        """
-
         cutoff = sent_before_or_at or read_at
         with self._connect() as db:
             rows = db.execute(
@@ -368,12 +526,11 @@ class SQLiteSimulationStore:
                     continue
                 metadata["read_at"] = read_at.isoformat()
                 metadata["read_status"] = "READ"
-                metadata["read_receipt_source"] = "SIMULATION_INFERENCE"
+                metadata["read_receipt_source"] = source
                 updates.append((json.dumps(metadata, ensure_ascii=False), int(row["id"])))
             if updates:
                 db.executemany(
-                    "UPDATE simulation_messages SET metadata_json=? WHERE id=?",
-                    updates,
+                    "UPDATE simulation_messages SET metadata_json=? WHERE id=?", updates
                 )
         return len(updates)
 
@@ -385,8 +542,6 @@ class SQLiteSimulationStore:
         conversation_id: str,
         user_sender_person_id: str = "self",
     ) -> int:
-        """Infer read state for old live sessions that already contain replies."""
-
         with self._connect() as db:
             rows = db.execute(
                 "SELECT id,timestamp,sender_person_id,metadata_json FROM simulation_messages "
@@ -417,8 +572,7 @@ class SQLiteSimulationStore:
                 unread_ids.clear()
             if updates:
                 db.executemany(
-                    "UPDATE simulation_messages SET metadata_json=? WHERE id=?",
-                    updates,
+                    "UPDATE simulation_messages SET metadata_json=? WHERE id=?", updates
                 )
         return len(updates)
 
@@ -454,10 +608,10 @@ class SQLiteSimulationStore:
         platform: str,
         conversation_id: str,
     ) -> None:
-        placeholders = ",".join("?" for _ in _ACTIVE_STATUSES)
         with self._connect() as db:
+            placeholders = ",".join("?" for _ in _ACTIVE_STATUSES)
             db.execute(
-                "UPDATE scheduled_events SET status='CANCELLED' "
+                "UPDATE scheduled_events SET status='CANCELLED',claim_token=NULL,claimed_at=NULL "
                 "WHERE twin_person_id=? AND platform=? AND conversation_id=? "
                 f"AND status IN ({placeholders})",
                 (twin_person_id, platform, conversation_id, *_ACTIVE_STATUSES),
@@ -485,6 +639,12 @@ class SQLiteSimulationStore:
             next_attempt_at=(
                 datetime.fromisoformat(row["next_attempt_at"])
                 if "next_attempt_at" in keys and row["next_attempt_at"]
+                else None
+            ),
+            claim_token=(row["claim_token"] if "claim_token" in keys else None),
+            claimed_at=(
+                datetime.fromisoformat(row["claimed_at"])
+                if "claimed_at" in keys and row["claimed_at"]
                 else None
             ),
         )

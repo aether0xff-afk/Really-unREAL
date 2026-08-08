@@ -8,10 +8,11 @@ from tkinter.scrolledtext import ScrolledText
 
 from backend.gui_live import LiveChatSession
 from backend.providers.errors import PermanentGenerationError, TransientGenerationError
+from backend.simulation.action_policy import Action
 
 
 class LiveChatWindow(tk.Toplevel):
-    """A small messenger-like view over a persistent LiveChatSession."""
+    """Messenger-like view over a persistent LiveChatSession."""
 
     def __init__(self, master: tk.Misc, session: LiveChatSession) -> None:
         super().__init__(master)
@@ -71,9 +72,9 @@ class LiveChatWindow(tk.Toplevel):
         ttk.Label(
             root,
             text=(
-                "답장/읽음 상태는 과거 행동을 바탕으로 한 SIMULATION 추정입니다. "
-                "실제 카카오톡 읽음 여부가 아닙니다. 모델/API가 실패해도 이미 모델링된 "
-                "읽음·답장 행동 시각은 바뀌지 않습니다."
+                "읽음은 실제 카카오톡 receipt가 아니라 SIMULATION 추정입니다. "
+                "1.2에서는 READ와 REPLY가 서로 다른 시각에 발생할 수 있고, "
+                "상대가 WAIT를 선택하면 답장이 예약되지 않을 수도 있습니다."
             ),
             wraplength=580,
         ).grid(row=4, column=0, sticky="ew", pady=(8, 0))
@@ -107,9 +108,9 @@ class LiveChatWindow(tk.Toplevel):
                 self.transcript.insert("end", f"{speaker}  {stamp}\n{message.text}\n")
                 if not is_target:
                     receipt = (
-                        f"읽음 · {message.read_at.strftime('%H:%M')}"
+                        f"읽음 추정 · {message.read_at.strftime('%H:%M')}"
                         if message.read_at is not None
-                        else "안읽음"
+                        else "안읽음 추정"
                     )
                     self.transcript.insert("end", f"  {receipt}\n")
                 self.transcript.insert("end", "\n")
@@ -128,7 +129,6 @@ class LiveChatWindow(tk.Toplevel):
         self.message_var.set("")
         self._refresh_transcript()
         self.status_var.set(self.session.pending_label())
-        self.retry_button.configure(state="disabled")
 
     def _poll(self) -> None:
         if self._closed:
@@ -136,38 +136,36 @@ class LiveChatWindow(tk.Toplevel):
         now = datetime.now()
         event = self.session.pending_event()
         if event is None:
-            self.status_var.set("대기 중 · 지금은 보낼 행동이 예약되어 있지 않음")
+            self.status_var.set(self.session.pending_label(now=now))
             self.retry_button.configure(state="disabled")
         elif event.status == "BLOCKED":
             self.status_var.set(self.session.pending_label(now=now))
             self.retry_button.configure(state="normal")
         elif event.ready_at <= now and not self._generating:
             self.retry_button.configure(state="disabled")
-            self._start_generation()
+            self._start_due_processing(event.action)
         elif not self._generating:
             self.retry_button.configure(state="disabled")
             self.status_var.set(self.session.pending_label(now=now))
         self.after(500, self._poll)
 
-    def _start_generation(self) -> None:
+    def _start_due_processing(self, action: Action) -> None:
         self._generating = True
-        self.status_var.set(f"{self.session.target_alias} 답장 생성 중…")
+        if action == Action.READ:
+            self.status_var.set("읽음 상태 처리 중…")
+        else:
+            self.status_var.set(f"{self.session.target_alias} 행동 실행 중…")
 
         def work() -> None:
             try:
                 self.session.process_due(now=datetime.now())
-            except TransientGenerationError as exc:
-                event = self.session.defer_generation_failure(exc, now=datetime.now())
-                if not self._closed:
-                    self.after(0, lambda: self._generation_deferred(event))
-                return
-            except PermanentGenerationError as exc:
-                self.session.block_generation_failure(exc)
+            except (TransientGenerationError, PermanentGenerationError) as exc:
+                # Compatibility fallback: the 1.2 runtime normally persists these
+                # failures itself before returning.
                 if not self._closed:
                     self.after(0, lambda: self._generation_blocked(exc))
                 return
             except Exception as exc:
-                self.session.block_generation_failure(exc)
                 if not self._closed:
                     self.after(0, lambda: self._generation_blocked(exc))
                 return
@@ -179,29 +177,21 @@ class LiveChatWindow(tk.Toplevel):
     def _generation_finished(self) -> None:
         self._generating = False
         self._refresh_transcript()
-        self.retry_button.configure(state="disabled")
         self.status_var.set(self.session.pending_label())
-
-    def _generation_deferred(self, event) -> None:
-        self._generating = False
-        # process_due marks a due REPLY as read before contacting the provider,
-        # so a 503 must still become visible in the transcript.
-        self._refresh_transcript()
-        self.retry_button.configure(state="disabled")
-        if event is None:
-            self.status_var.set("모델 일시 오류 · 예약된 행동 확인 중")
-        else:
-            self.status_var.set(self.session.pending_label())
+        event = self.session.pending_event()
+        self.retry_button.configure(
+            state="normal" if event is not None and event.status == "BLOCKED" else "disabled"
+        )
 
     def _generation_blocked(self, exc: Exception) -> None:
         self._generating = False
         self._refresh_transcript()
         self.retry_button.configure(state="normal")
-        self.status_var.set("답장 행동 보존됨 · 모델 설정 확인 후 생성 재시도")
+        self.status_var.set("행동 보존됨 · 모델 설정 확인 후 생성 재시도")
         messagebox.showerror(
             "Really-unREAL",
-            "모델 호출을 계속할 수 없습니다. 예약된 읽음/답장 행동은 지우지 않았습니다.\n\n"
-            f"{exc}\n\n설정/API key를 확인한 뒤 창을 다시 열거나 '생성 재시도'를 누르세요.",
+            "모델 호출을 계속할 수 없습니다. 이미 모델링된 행동은 지우지 않았습니다.\n\n"
+            f"{exc}\n\n설정/API key를 확인한 뒤 '생성 재시도'를 누르세요.",
             parent=self,
         )
 
@@ -218,7 +208,7 @@ class LiveChatWindow(tk.Toplevel):
     def _reset(self) -> None:
         if not messagebox.askyesno(
             "새 대화",
-            "현재 SIMULATION 대화와 예약된 답장을 지울까요?\n실제 카카오톡 원본은 지워지지 않습니다.",
+            "현재 SIMULATION 대화와 예약된 행동을 지울까요?\n실제 카카오톡 원본은 지워지지 않습니다.",
             parent=self,
         ):
             return
