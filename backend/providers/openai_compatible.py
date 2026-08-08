@@ -10,6 +10,7 @@ from typing import Any
 
 from backend.generation import GeneratedBurst, generation_prompt
 from backend.generation_context import GenerationContextPacket
+from backend.providers.errors import PermanentGenerationError, TransientGenerationError
 
 
 Transport = Callable[[str, dict[str, str], dict[str, Any], float], dict[str, Any]]
@@ -48,12 +49,7 @@ def _extract_json_object(text: str) -> str:
 
 
 class OpenAICompatibleLanguageModel:
-    """Minimal OpenAI-compatible chat-completions adapter.
-
-    This is primarily intended for local inference servers such as LM Studio,
-    llama.cpp, vLLM, or a local NIM endpoint. The endpoint and model are explicit
-    so no particular vendor is baked into the simulator core.
-    """
+    """Minimal OpenAI-compatible chat-completions adapter."""
 
     def __init__(
         self,
@@ -100,10 +96,7 @@ class OpenAICompatibleLanguageModel:
         }
 
     def _request(self, packet: GenerationContextPacket) -> dict[str, Any]:
-        headers = {
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-        }
+        headers = {"Content-Type": "application/json", "Accept": "application/json"}
         if self._api_key:
             headers["Authorization"] = f"Bearer {self._api_key}"
         url = f"{self.base_url}/chat/completions"
@@ -114,15 +107,22 @@ class OpenAICompatibleLanguageModel:
                 return self._transport(url, headers, payload, self.timeout_seconds)
             except urllib.error.HTTPError as exc:
                 retryable = exc.code == 429 or 500 <= exc.code < 600
-                if not retryable or attempt >= self.max_attempts:
-                    raise RuntimeError(
-                        f"OpenAI-compatible request failed with HTTP {exc.code}"
+                if retryable:
+                    if attempt >= self.max_attempts:
+                        raise TransientGenerationError(
+                            f"Local/OpenAI-compatible provider temporarily unavailable (HTTP {exc.code})"
+                        ) from exc
+                else:
+                    raise PermanentGenerationError(
+                        f"Local/OpenAI-compatible request rejected (HTTP {exc.code})"
                     ) from exc
-            except urllib.error.URLError as exc:
+            except (urllib.error.URLError, TimeoutError) as exc:
                 if attempt >= self.max_attempts:
-                    raise RuntimeError("OpenAI-compatible request failed") from exc
+                    raise TransientGenerationError(
+                        "Local/OpenAI-compatible provider temporarily unreachable"
+                    ) from exc
             time.sleep(min(2 ** (attempt - 1), 4))
-        raise RuntimeError("OpenAI-compatible request failed")
+        raise TransientGenerationError("Local/OpenAI-compatible request temporarily failed")
 
     def generate_burst(self, packet: GenerationContextPacket) -> GeneratedBurst:
         last_error: Exception | None = None
@@ -135,4 +135,6 @@ class OpenAICompatibleLanguageModel:
                 return GeneratedBurst.from_json(_extract_json_object(content))
             except (KeyError, IndexError, TypeError, ValueError, json.JSONDecodeError) as exc:
                 last_error = exc
-        raise ValueError("model failed the generated-burst JSON contract") from last_error
+        raise PermanentGenerationError(
+            "Local/OpenAI-compatible model returned an invalid message format"
+        ) from last_error
