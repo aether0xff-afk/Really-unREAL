@@ -21,6 +21,16 @@ def _percent(value: object) -> str:
         return "-"
 
 
+def _ci_text(value: object) -> str:
+    if not isinstance(value, dict):
+        return ""
+    lower = value.get("lower")
+    upper = value.get("upper")
+    if lower is None or upper is None:
+        return ""
+    return f" (95% 구간 {_percent(lower)}~{_percent(upper)})"
+
+
 def _friendly_result(result: dict[str, object]) -> str:
     if "audit" in result:
         lines = [
@@ -43,7 +53,8 @@ def _friendly_result(result: dict[str, object]) -> str:
         selection = result.get("temporal_selection")
         if isinstance(selection, dict):
             selected = selection.get("selected_model", "-")
-            lines.extend(["", f"선택된 답장 시간 모델  {selected}"])
+            friendly = "상황 기반" if selected == "hazard" else "관계별 경험 분포"
+            lines.extend(["", f"선택된 답장 시간 모델  {friendly}"])
         warning = result.get("warning")
         if warning:
             lines.extend(["", f"주의: {warning}"])
@@ -62,12 +73,13 @@ def _friendly_result(result: dict[str, object]) -> str:
     elapsed = float(result.get("elapsed_seconds", 0.0) or 0.0)
     burst_error = result.get("mean_burst_size_absolute_error")
     char_f1 = result.get("mean_char_bigram_f1")
+    token_f1 = result.get("mean_token_f1")
+    ending_f1 = result.get("mean_ending_f1")
     laugh = result.get("laugh_presence_match_rate")
     cry = result.get("cry_presence_match_rate")
     question = result.get("question_presence_match_rate")
-    early = int(result.get("temporal_early_predictions", 0) or 0)
-    late = int(result.get("temporal_late_predictions", 0) or 0)
-    timing_inside = max(0, generated - early - late)
+    timing_rate = result.get("timing_inside_rate")
+    sample_note = result.get("evaluation_sample_note")
 
     lines = [
         "모델 성능 테스트 완료",
@@ -76,19 +88,27 @@ def _friendly_result(result: dict[str, object]) -> str:
         f"실패             {failed}",
         f"소요 시간        {elapsed:.1f}초",
         "",
-        f"문장 형태 유사도 {_percent(char_f1)}",
+        "내용/문장 재현",
+        f"글자 패턴 유사도 {_percent(char_f1)}{_ci_text(result.get('mean_char_bigram_f1_ci95'))}",
+        f"단어 겹침        {_percent(token_f1)}{_ci_text(result.get('mean_token_f1_ci95'))}",
+        f"말끝 형태        {_percent(ending_f1)}{_ci_text(result.get('mean_ending_f1_ci95'))}",
+        "",
+        "표현 행동",
         f"웃음 표현 일치   {_percent(laugh)}",
         f"울음 표현 일치   {_percent(cry)}",
         f"질문 여부 일치   {_percent(question)}",
-        f"답장 타이밍 범위 {timing_inside} / {generated if generated else requested}",
+        f"답장 타이밍 범위 {_percent(timing_rate)}{_ci_text(result.get('timing_inside_rate_ci95'))}",
     ]
     if burst_error is not None:
         lines.append(f"메시지 분할 오차 평균 {float(burst_error):.2f}개")
+    if sample_note:
+        lines.extend(["", f"표본 해석: {sample_note}"])
     lines.extend(
         [
             "",
             "이 화면은 '대화'가 아니라 과거 실제 답을 숨긴 재현 시험입니다.",
-            "실제로 시뮬레이션과 대화하려면 아래 '대화 시작'을 누르세요.",
+            "NVIDIA 기본 3개는 빠른 작동 확인용입니다. 비교하려면 테스트 수를 10~20 이상으로 올리세요.",
+            "실제로 시뮬레이션과 대화하려면 '대화 시작'을 누르세요.",
             "세부 수치는 '결과 저장'으로 JSON에 저장할 수 있습니다.",
         ]
     )
@@ -108,7 +128,7 @@ class ResponsiveReallyUnrealApp(ReallyUnrealApp):
         self._responsive_last_mode: str | None = None
         super().__init__()
 
-        self._rename_mode_labels(self)
+        self._rename_labels(self)
         controls = self.run_button.master
         self.run_button.configure(text="빠른 진단")
         self.cancel_button = ttk.Button(
@@ -142,12 +162,13 @@ class ResponsiveReallyUnrealApp(ReallyUnrealApp):
             "1.0",
             "1) 빠른 진단: 데이터와 답장 시간 모델 확인\n"
             "2) 모델 성능 테스트: 과거 실제 답을 숨기고 재현 점수 측정\n"
+            "   · NVIDIA 기본 3개 = 빠른 작동 확인, 비교용은 10~20개 이상 권장\n"
             "3) 대화 시작: 현재 시점에서 실제 시간 흐름으로 시뮬레이션 대화\n",
         )
         self.output.configure(state="disabled")
         self._sync_provider_defaults()
 
-    def _rename_mode_labels(self, widget: tk.Misc) -> None:
+    def _rename_labels(self, widget: tk.Misc) -> None:
         for child in widget.winfo_children():
             if isinstance(child, ttk.Radiobutton):
                 text = str(child.cget("text"))
@@ -157,7 +178,9 @@ class ResponsiveReallyUnrealApp(ReallyUnrealApp):
                     child.configure(text="모델 테스트 · Local LLM")
                 elif text == "NVIDIA NIM":
                     child.configure(text="모델 테스트 · NVIDIA NIM")
-            self._rename_mode_labels(child)
+            elif isinstance(child, ttk.Label) and str(child.cget("text")) == "Cases":
+                child.configure(text="테스트 수")
+            self._rename_labels(child)
 
     def _set_busy(self, busy: bool, status: str) -> None:
         super()._set_busy(busy, status)
