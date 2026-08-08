@@ -42,8 +42,6 @@ class ShadowReport:
 
 
 def _shadow_evidence(evidence: PersonEvidence, start_at: datetime) -> PersonEvidence:
-    """Hide all target-authored future messages while retaining exogenous input."""
-
     conversations: list[EvidenceConversation] = []
     for conversation in evidence.conversations:
         visible = tuple(
@@ -100,15 +98,20 @@ def run_shadow_simulation(
     start_at: datetime | None = None,
     end_at: datetime | None = None,
     context_size: int = 30,
+    match_window_seconds: float = 21600.0,
 ) -> tuple[ShadowReport, tuple[ShadowPredictedEvent, ...]]:
     """Replay a past interval without feeding hidden target messages back in.
 
-    Counterpart messages remain exogenous observations, like incoming messages in
-    live mode. Target-authored reality after ``start_at`` is withheld from the
-    simulator and used only after the run for event/content scoring. Simulated
-    target messages become the subsequent visible context, producing a true
-    closed-loop drift test instead of independent teacher-forced cases.
+    Counterpart messages remain exogenous observations. Target-authored reality
+    after ``start_at`` is withheld and used only after the run for scoring.
+    Predicted and real events are matched only within ``match_window_seconds`` so
+    a wildly mistimed message cannot earn a match merely by being the nearest one.
     """
+
+    if context_size < 1:
+        raise ValueError("context_size must be >= 1")
+    if match_window_seconds <= 0:
+        raise ValueError("match_window_seconds must be > 0")
 
     real_cases = sorted(
         [case for case in replay_cases if case.conversation_id == conversation_id],
@@ -125,11 +128,7 @@ def run_shadow_simulation(
         raise ValueError("shadow interval has no real target events")
 
     conversation = next(
-        (
-            item
-            for item in evidence.conversations
-            if item.conversation_id == conversation_id
-        ),
+        (item for item in evidence.conversations if item.conversation_id == conversation_id),
         None,
     )
     if conversation is None:
@@ -140,11 +139,11 @@ def run_shadow_simulation(
     index = CutoffExampleIndex.from_replay_cases(pre_shadow_cases)
 
     visible = [
-        item for item in conversation.messages
-        if item.message.timestamp < start_at
+        item for item in conversation.messages if item.message.timestamp < start_at
     ][-context_size:]
     exogenous = [
-        item for item in conversation.messages
+        item
+        for item in conversation.messages
         if start_at <= item.message.timestamp <= end_at
         and item.sender_person_id != evidence.person_id
     ]
@@ -185,10 +184,10 @@ def run_shadow_simulation(
             if exogenous_index < len(exogenous)
             else None
         )
-        candidates = [value for value in (next_external, pending_at) if value is not None]
-        if not candidates:
+        timestamps = [value for value in (next_external, pending_at) if value is not None]
+        if not timestamps:
             break
-        next_at = min(candidates)
+        next_at = min(timestamps)
         if next_at > end_at:
             break
 
@@ -244,11 +243,13 @@ def run_shadow_simulation(
     matched = 0
 
     for real in real_cases:
-        candidates = [
-            index
-            for index in unused
-            if real.action_is_ambiguous or predicted[index].action == real.action
-        ]
+        candidates = []
+        for index in unused:
+            if not (real.action_is_ambiguous or predicted[index].action == real.action):
+                continue
+            error = abs((predicted[index].at - real.action_at).total_seconds())
+            if error <= match_window_seconds:
+                candidates.append(index)
         if not candidates:
             continue
         best = min(
