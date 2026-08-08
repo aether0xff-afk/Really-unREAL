@@ -52,7 +52,7 @@ def _weighted_quantile(
 
 
 def _observable_candidate_action(case: ReplayCase) -> Action:
-    """Infer the action type from visible context, not the held-out label."""
+    """Infer the coarse action type from visible context, not held-out text."""
 
     if not case.context:
         raise ValueError("ReplayCase has no visible context")
@@ -91,10 +91,9 @@ class EmpiricalTimingBaseline:
     supplemental without duplicating data.
 
     Coarse timestamp observations are fitted with the center of their feasible
-    delay interval rather than a fake exact timestamp.
-
-    The baseline is not expected to be the final timing model. It exists so a
-    later survival/hazard model has a concrete held-out benchmark to beat.
+    delay interval rather than a fake exact timestamp. Long-gap events whose
+    REPLY-vs-INITIATE role is ambiguous remain in the global timing distribution
+    but are excluded from action-conditioned buckets.
     """
 
     def __init__(
@@ -132,11 +131,13 @@ class EmpiricalTimingBaseline:
         ]
         global_threshold = _weighted_quantile(global_samples, quantile)
 
+        confident_cases = [case for case in cases if not case.action_is_ambiguous]
+
         action_thresholds: dict[Action, float] = {}
         for action in (Action.REPLY, Action.INITIATE):
             bucket = [
                 (_representative_training_delay_seconds(case), case.evidence_weight)
-                for case in cases
+                for case in confident_cases
                 if _observable_candidate_action(case) == action
             ]
             if bucket:
@@ -144,7 +145,7 @@ class EmpiricalTimingBaseline:
 
         platform_thresholds: dict[tuple[str, Action], float] = {}
         buckets: dict[tuple[str, Action], list[tuple[float, float]]] = {}
-        for case in cases:
+        for case in confident_cases:
             action = _observable_candidate_action(case)
             buckets.setdefault((case.platform, action), []).append(
                 (_representative_training_delay_seconds(case), case.evidence_weight)
