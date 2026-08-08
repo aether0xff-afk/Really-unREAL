@@ -122,7 +122,11 @@ def _previous_gap_bucket(case: ReplayCase) -> str:
 def _since_last_bucket(case: ReplayCase, elapsed_seconds: float) -> str:
     if not case.context:
         return "unknown"
-    elapsed = max(0.0, float(elapsed_seconds))
+    base_gap = max(
+        0.0,
+        (case.observation_end - case.context[-1].message.timestamp).total_seconds(),
+    )
+    elapsed = base_gap + max(0.0, float(elapsed_seconds))
     if elapsed <= 60:
         return "<=1m"
     if elapsed <= 300:
@@ -154,7 +158,10 @@ def _message_kind(case: ReplayCase) -> str:
 
 def _feature_tuple(case: ReplayCase, elapsed_seconds: float) -> tuple[object, ...]:
     observed_at = case.observation_end + timedelta(seconds=elapsed_seconds)
-    action = case.action if not case.action_is_ambiguous else _candidate_action(case, elapsed_seconds)
+    # Action identity must itself be observable at this elapsed time. In
+    # particular, a future long-gap INITIATE cannot leak its held-out label into
+    # earlier survival bins where it is still only a possible FOLLOW_UP.
+    action = _candidate_action(case, elapsed_seconds)
     return (
         action.value,
         case.platform,
