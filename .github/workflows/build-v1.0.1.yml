@@ -52,17 +52,26 @@ jobs:
       - name: Import GUI entry point
         id: import_gui
         continue-on-error: true
-        run: python -c "import backend.gui; print('GUI import OK')"
+        run: python -c "import backend.gui; import backend.gui_entry; print('GUI import OK')"
 
       - name: Build portable executable
         id: build
         if: steps.tests.outcome == 'success' && steps.import_gui.outcome == 'success'
         continue-on-error: true
-        run: pyinstaller --noconfirm --clean --onefile --windowed --name Really-unREAL backend/gui.py
+        run: pyinstaller --noconfirm --clean --onefile --windowed --name Really-unREAL backend/gui_entry.py
+
+      - name: Smoke test packaged executable
+        id: exe_smoke
+        if: steps.build.outcome == 'success'
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          & .\dist\Really-unREAL.exe --smoke
+          exit $LASTEXITCODE
 
       - name: Package portable ZIP
         id: package
-        if: steps.build.outcome == 'success'
+        if: steps.exe_smoke.outcome == 'success'
         continue-on-error: true
         shell: pwsh
         run: |
@@ -89,6 +98,7 @@ jobs:
               ['v1.0.1-tests', '${{ steps.tests.outcome }}', 'pytest'],
               ['v1.0.1-gui-import', '${{ steps.import_gui.outcome }}', 'GUI import'],
               ['v1.0.1-pyinstaller', '${{ steps.build.outcome }}', 'PyInstaller'],
+              ['v1.0.1-exe-smoke', '${{ steps.exe_smoke.outcome }}', 'packaged exe smoke'],
               ['v1.0.1-package', '${{ steps.package.outcome }}', 'portable ZIP'],
             ];
             for (const [contextName, outcome, label] of entries) {
@@ -128,5 +138,5 @@ jobs:
             });
 
       - name: Fail when validation failed
-        if: always() && (steps.tests.outcome != 'success' || steps.import_gui.outcome != 'success' || steps.build.outcome != 'success' || steps.package.outcome != 'success')
+        if: always() && (steps.tests.outcome != 'success' || steps.import_gui.outcome != 'success' || steps.build.outcome != 'success' || steps.exe_smoke.outcome != 'success' || steps.package.outcome != 'success')
         run: exit 1
