@@ -36,6 +36,7 @@ class LiveChatMessage:
     timestamp: datetime
     sender_person_id: str
     text: str
+    read_at: datetime | None = None
 
 
 def default_live_store_path() -> Path:
@@ -140,6 +141,16 @@ class LiveChatSession:
         self.historical_conversation = selected
         self.store = store
         self.timing_sampler = timing_sampler
+
+        # <=1.1.0 sessions did not store read receipts. If an old simulation
+        # already contains a target reply, conservatively mark preceding user
+        # messages as read at that simulated reply time.
+        self.store.backfill_read_receipts(
+            twin_person_id=target_id,
+            platform="kakao",
+            conversation_id=selected.conversation_id,
+        )
+
         self.engine = LiveSimulationEngine(
             twin_person_id=target_id,
             platform="kakao",
@@ -169,10 +180,19 @@ class LiveChatSession:
         )
 
     def chat_messages(self) -> list[LiveChatMessage]:
-        return [
-            LiveChatMessage(message.timestamp, message.sender, message.text)
-            for message in self._simulation_messages()
-        ]
+        output: list[LiveChatMessage] = []
+        for message in self._simulation_messages():
+            raw_read_at = message.metadata.get("read_at") if message.metadata else None
+            read_at = datetime.fromisoformat(str(raw_read_at)) if raw_read_at else None
+            output.append(
+                LiveChatMessage(
+                    message.timestamp,
+                    message.sender,
+                    message.text,
+                    read_at=read_at,
+                )
+            )
+        return output
 
     def _visible_context(self) -> tuple[EvidenceMessage, ...]:
         historical = tuple(self.historical_conversation.messages[-40:])
@@ -200,7 +220,12 @@ class LiveChatSession:
             conversation_id=self.conversation_id,
             sender_person_id="self",
             messages=((now, text),),
-            metadata={"role": "user", "ui_live": True},
+            metadata={
+                "role": "user",
+                "ui_live": True,
+                "read_status": "UNREAD",
+                "read_receipt_source": "SIMULATION_INFERENCE",
+            },
         )
         return self.engine.observe_counterpart_message(
             observed_at=now,
