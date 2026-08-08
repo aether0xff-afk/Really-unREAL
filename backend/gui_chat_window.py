@@ -72,7 +72,7 @@ class LiveChatWindow(tk.Toplevel):
             root,
             text=(
                 "답장은 과거 행동 모델이 먼저 예약합니다. 모델/API가 일시적으로 실패해도 "
-                "예약된 행동은 사라지지 않고 생성만 다시 시도합니다."
+                "사람의 답장 예정 시각은 바뀌지 않고, 생성 전달만 다시 시도합니다."
             ),
             wraplength=580,
         ).grid(row=4, column=0, sticky="ew", pady=(8, 0))
@@ -135,7 +135,7 @@ class LiveChatWindow(tk.Toplevel):
         elif event.status == "BLOCKED":
             self.status_var.set(self.session.pending_label(now=now))
             self.retry_button.configure(state="normal")
-        elif event.due_at <= now and not self._generating:
+        elif event.ready_at <= now and not self._generating:
             self.retry_button.configure(state="disabled")
             self._start_generation()
         elif not self._generating:
@@ -161,8 +161,6 @@ class LiveChatWindow(tk.Toplevel):
                     self.after(0, lambda: self._generation_blocked(exc))
                 return
             except Exception as exc:
-                # Unknown failures must not create a hot retry loop. Preserve the
-                # scheduled behavior as BLOCKED until the user explicitly retries.
                 self.session.block_generation_failure(exc)
                 if not self._closed:
                     self.after(0, lambda: self._generation_blocked(exc))
