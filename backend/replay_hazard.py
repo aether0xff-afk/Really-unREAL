@@ -33,8 +33,26 @@ ELAPSED_BINS_SECONDS: tuple[float, ...] = (
 )
 _SESSION_GAP_SECONDS = 6.0 * 3600.0
 _INTERROGATIVE_RE = re.compile(
-    r"(^|\s)(뭐|왜|언제|어디|누구|누가|몇|어떻게|어케|얼마|어느)(\s|$)|"
-    r"(뭐함|뭐해|뭐하|몇시|어디감|어디가|언제감|언제와|가능함|가능해|맞음|맞아)$"
+    r"(^|\s)(뭐|왜|언제|어디|누구|누가|몇|어떻게|어케|얼마|어느)(\s|$)"
+)
+_QUESTION_STEMS = (
+    "뭐함",
+    "뭐해",
+    "뭐하",
+    "몇시",
+    "몇명",
+    "몇개",
+    "어디감",
+    "어디가",
+    "언제감",
+    "언제와",
+    "어떻게",
+    "어케",
+    "얼마",
+    "가능함",
+    "가능해",
+    "맞음",
+    "맞아",
 )
 
 
@@ -106,7 +124,10 @@ def _previous_gap_bucket(case: ReplayCase) -> str:
         return "unknown"
     gap = max(
         0.0,
-        (case.context[-1].message.timestamp - case.context[-2].message.timestamp).total_seconds(),
+        (
+            case.context[-1].message.timestamp
+            - case.context[-2].message.timestamp
+        ).total_seconds(),
     )
     if gap <= 60:
         return "<=1m"
@@ -149,7 +170,11 @@ def _message_kind(case: ReplayCase) -> str:
         return "none"
     text = case.context[-1].message.text.strip()
     compact = "".join(text.split())
-    if "?" in text or _INTERROGATIVE_RE.search(text):
+    if (
+        "?" in text
+        or _INTERROGATIVE_RE.search(text)
+        or any(stem in compact for stem in _QUESTION_STEMS)
+    ):
         return "question"
     if len(compact) <= 4:
         return "very_short"
@@ -272,14 +297,20 @@ class DiscreteHazardModel:
         global_hazard = self.global_hazards[bin_index]
 
         for level in range(len(keys) - 1, -1, -1):
-            risk, events = self.tables[level].get((keys[level], bin_index), (0.0, 0.0))
+            risk, events = self.tables[level].get(
+                (keys[level], bin_index),
+                (0.0, 0.0),
+            )
             if level != 0 and risk < self.minimum_effective_risk:
                 continue
             denominator = risk + self.prior_strength
             if denominator <= 0:
                 return min(1.0, max(0.0, global_hazard))
-            probability = (events + self.prior_strength * global_hazard) / denominator
+            probability = (
+                events + self.prior_strength * global_hazard
+            ) / denominator
             return min(1.0, max(0.0, probability))
+
         return min(1.0, max(0.0, global_hazard))
 
     def predict_action(
@@ -347,7 +378,12 @@ class DiscreteHazardModel:
         best_score = -1.0
         for step in range(1, 100):
             threshold = step / 100.0
-            metrics = evaluate_hazard_model(self, cases, snapshots, threshold=threshold)
+            metrics = evaluate_hazard_model(
+                self,
+                cases,
+                snapshots,
+                threshold=threshold,
+            )
             if metrics.balanced_accuracy > best_score:
                 best_score = metrics.balanced_accuracy
                 best_threshold = threshold
@@ -373,13 +409,17 @@ def evaluate_hazard_model(
 ) -> HazardMetrics:
     snapshots = list(snapshots or build_action_snapshots(cases))
     by_id = {case.case_id: case for case in cases}
-    confusion: dict[str, Counter[str]] = {action.value: Counter() for action in Action}
+    confusion: dict[str, Counter[str]] = {
+        action.value: Counter() for action in Action
+    }
     correct = 0
 
     for snapshot in snapshots:
         case = by_id.get(snapshot.case_id)
         if case is None:
-            raise ValueError(f"snapshot references unknown replay case {snapshot.case_id!r}")
+            raise ValueError(
+                f"snapshot references unknown replay case {snapshot.case_id!r}"
+            )
         predicted = model.predict_action(
             case,
             elapsed_seconds=snapshot.elapsed_seconds,
@@ -428,7 +468,9 @@ def evaluate_hazard_model(
         reply_recall=recalls[Action.REPLY],
         follow_up_recall=recalls[Action.FOLLOW_UP],
         initiate_recall=recalls[Action.INITIATE],
-        mean_interval_error_seconds=(round(mean_error, 3) if mean_error is not None else None),
+        mean_interval_error_seconds=(
+            round(mean_error, 3) if mean_error is not None else None
+        ),
         median_interval_error_seconds=(
             round(median_error, 3) if median_error is not None else None
         ),
@@ -461,9 +503,15 @@ def select_temporal_model(
     hazard.tune_decision_threshold(validation_cases, validation_snapshots)
 
     baseline_metrics = evaluate_empirical_baseline(
-        baseline, validation_cases, validation_snapshots
+        baseline,
+        validation_cases,
+        validation_snapshots,
     )
-    hazard_metrics = evaluate_hazard_model(hazard, validation_cases, validation_snapshots)
+    hazard_metrics = evaluate_hazard_model(
+        hazard,
+        validation_cases,
+        validation_snapshots,
+    )
 
     confident_train_events = sum(not case.action_is_ambiguous for case in train_cases)
     confident_validation_events = sum(
