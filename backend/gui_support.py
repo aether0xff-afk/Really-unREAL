@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from collections import Counter
+from datetime import datetime
+from pathlib import Path
 from typing import Iterable
 
 from backend.fusion import collect_person_evidence
@@ -27,11 +30,86 @@ NVIDIA_BASE_URL = "https://integrate.api.nvidia.com/v1"
 NVIDIA_MODEL = "nvidia/nemotron-3-ultra-550b-a55b"
 
 
-def load_quick_kakao(path: str) -> list[ConversationExport]:
-    conversations = load_kakao_archive(path)
-    if not conversations:
-        raise ValueError("카카오톡 대화를 찾지 못했습니다. ZIP 안에 Talk_*.txt가 있는지 확인하세요.")
-    return conversations
+def _normalize_archive_paths(
+    paths: str | Path | Iterable[str | Path],
+) -> tuple[Path, ...]:
+    if isinstance(paths, (str, Path)):
+        raw_paths = (paths,)
+    else:
+        raw_paths = tuple(paths)
+    if not raw_paths:
+        raise ValueError("카카오톡 ZIP을 하나 이상 선택하세요.")
+
+    unique: list[Path] = []
+    seen: set[str] = set()
+    for raw in raw_paths:
+        path = Path(raw)
+        key = str(path.absolute())
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(path)
+    return tuple(unique)
+
+
+def _conversation_fingerprint(conversation: ConversationExport) -> str:
+    """Fingerprint message content so the same export selected twice is ignored."""
+
+    digest = hashlib.sha256()
+    for message in conversation.messages:
+        payload = (
+            message.timestamp.isoformat(),
+            message.sender,
+            message.text,
+            message.message_type.value,
+        )
+        digest.update(
+            json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        )
+        digest.update(b"\n")
+    return digest.hexdigest()
+
+
+def load_quick_kakao(
+    paths: str | Path | Iterable[str | Path],
+) -> list[ConversationExport]:
+    """Load one or many Kakao ZIPs for the desktop quick path.
+
+    Every selected ZIP can itself be either a single-chat Kakao export or an
+    outer bundle containing several per-chat ZIPs. Exact duplicate
+    conversations are removed after loading, which prevents accidentally
+    selecting the same archive twice from double-counting evidence.
+    """
+
+    conversations: list[ConversationExport] = []
+    for path in _normalize_archive_paths(paths):
+        try:
+            conversations.extend(load_kakao_archive(path))
+        except Exception as exc:
+            raise ValueError(f"{path.name}을(를) 불러오지 못했습니다: {exc}") from exc
+
+    deduplicated: list[ConversationExport] = []
+    fingerprints: set[str] = set()
+    for conversation in conversations:
+        fingerprint = _conversation_fingerprint(conversation)
+        if fingerprint in fingerprints:
+            continue
+        fingerprints.add(fingerprint)
+        deduplicated.append(conversation)
+
+    if not deduplicated:
+        raise ValueError(
+            "카카오톡 대화를 찾지 못했습니다. 선택한 ZIP 안에 Talk_*.txt가 있는지 확인하세요."
+        )
+
+    deduplicated.sort(
+        key=lambda conversation: (
+            conversation.messages[0].timestamp if conversation.messages else datetime.max,
+            conversation.chat_name,
+            conversation.source_archive,
+        )
+    )
+    return deduplicated
 
 
 def _visible_aliases(conversation: ConversationExport) -> set[str]:

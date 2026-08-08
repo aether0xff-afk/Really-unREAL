@@ -28,6 +28,7 @@ class ReallyUnrealApp(tk.Tk):
         self.geometry("900x720")
         self.minsize(780, 620)
         self._conversations = []
+        self._archive_paths: tuple[str, ...] = ()
         self._last_result: dict[str, object] | None = None
 
         self.archive_var = tk.StringVar()
@@ -39,7 +40,7 @@ class ReallyUnrealApp(tk.Tk):
         self.api_key_var = tk.StringVar()
         self.limit_var = tk.IntVar(value=10)
         self.remote_consent_var = tk.BooleanVar(value=False)
-        self.status_var = tk.StringVar(value="카카오톡 ZIP을 선택하세요.")
+        self.status_var = tk.StringVar(value="카카오톡 ZIP을 하나 이상 선택하세요.")
 
         self._build_ui()
         self.mode_var.trace_add("write", lambda *_: self._sync_provider_defaults())
@@ -59,8 +60,8 @@ class ReallyUnrealApp(tk.Tk):
         intro = ttk.Label(
             root,
             text=(
-                "카카오톡 내보내기 ZIP만 넣으면 내 이름 후보와 대화 상대를 자동으로 찾습니다. "
-                "원본 대화는 GitHub나 결과 창에 업로드/출력하지 않습니다."
+                "카카오톡 내보내기 ZIP을 한 개 또는 여러 개 한꺼번에 넣으면 내 이름 후보와 "
+                "대화 상대를 자동으로 찾습니다. 원본 대화는 GitHub나 결과 창에 업로드/출력하지 않습니다."
             ),
             wraplength=820,
         )
@@ -70,9 +71,11 @@ class ReallyUnrealApp(tk.Tk):
         data_box.grid(row=2, column=0, sticky="ew")
         data_box.columnconfigure(1, weight=1)
         ttk.Label(data_box, text="카카오톡 ZIP").grid(row=0, column=0, sticky="w")
-        ttk.Entry(data_box, textvariable=self.archive_var).grid(row=0, column=1, sticky="ew", padx=8)
-        ttk.Button(data_box, text="찾아보기", command=self._browse_archive).grid(row=0, column=2)
-        self.scan_button = ttk.Button(data_box, text="불러오기", command=self._scan_archive)
+        ttk.Entry(data_box, textvariable=self.archive_var, state="readonly").grid(
+            row=0, column=1, sticky="ew", padx=8
+        )
+        ttk.Button(data_box, text="여러 ZIP 선택", command=self._browse_archive).grid(row=0, column=2)
+        self.scan_button = ttk.Button(data_box, text="다시 불러오기", command=self._scan_archive)
         self.scan_button.grid(row=0, column=3, padx=(8, 0))
 
         ttk.Label(data_box, text="내 이름").grid(row=1, column=0, sticky="w", pady=(10, 0))
@@ -134,24 +137,31 @@ class ReallyUnrealApp(tk.Tk):
         self._sync_provider_defaults()
 
     def _browse_archive(self) -> None:
-        path = filedialog.askopenfilename(
-            title="카카오톡 내보내기 ZIP 선택",
+        paths = filedialog.askopenfilenames(
+            title="카카오톡 내보내기 ZIP 선택 — 여러 개 선택 가능",
             filetypes=[("ZIP archive", "*.zip"), ("All files", "*.*")],
         )
-        if path:
-            self.archive_var.set(path)
-            self._scan_archive()
+        if not paths:
+            return
+
+        self._archive_paths = tuple(paths)
+        if len(paths) == 1:
+            self.archive_var.set(str(paths[0]))
+        else:
+            names = ", ".join(Path(path).name for path in paths[:3])
+            suffix = " …" if len(paths) > 3 else ""
+            self.archive_var.set(f"{len(paths)}개 ZIP 선택됨 · {names}{suffix}")
+        self._scan_archive()
 
     def _scan_archive(self) -> None:
-        path = self.archive_var.get().strip()
-        if not path:
-            messagebox.showinfo("Really-unREAL", "카카오톡 ZIP을 먼저 선택하세요.")
+        if not self._archive_paths:
+            messagebox.showinfo("Really-unREAL", "카카오톡 ZIP을 하나 이상 선택하세요.")
             return
-        self._set_busy(True, "ZIP 분석 중…")
+        self._set_busy(True, f"{len(self._archive_paths)}개 ZIP 분석 중…")
 
         def work() -> None:
             try:
-                conversations = load_quick_kakao(path)
+                conversations = load_quick_kakao(self._archive_paths)
                 candidates = rank_self_aliases(conversations)
                 if not candidates:
                     raise ValueError("대화 참여자 이름을 찾지 못했습니다.")
@@ -166,7 +176,10 @@ class ReallyUnrealApp(tk.Tk):
         self.self_combo["values"] = candidates
         self.self_var.set(candidates[0])
         self._refresh_targets()
-        self._set_busy(False, f"{len(conversations)}개 대화를 읽었습니다. 내 이름과 상대를 확인하세요.")
+        self._set_busy(
+            False,
+            f"{len(self._archive_paths)}개 ZIP에서 {len(conversations)}개 대화를 읽었습니다.",
+        )
 
     def _refresh_targets(self) -> None:
         if not self._conversations or not self.self_var.get():
@@ -272,11 +285,13 @@ class ReallyUnrealApp(tk.Tk):
     def _show_help(self) -> None:
         messagebox.showinfo(
             "Really-unREAL 사용법",
-            "1) 카카오톡 대화 내보내기 ZIP을 선택합니다.\n"
+            "1) '여러 ZIP 선택'에서 카카오톡 내보내기 ZIP을 한 개 이상 선택합니다.\n"
+            "   Ctrl/Shift로 여러 파일을 한 번에 고를 수 있습니다.\n"
             "2) 자동 추정된 '내 이름'이 맞는지 확인합니다.\n"
             "3) 재현할 대화 상대를 선택합니다.\n"
             "4) 처음에는 '빠른 Audit'을 실행합니다.\n"
             "5) 생성 평가가 필요하면 Local LLM 또는 NVIDIA NIM을 선택합니다.\n\n"
+            "각 ZIP은 단일 대화 ZIP이어도 되고, 여러 대화 ZIP을 담은 묶음 ZIP이어도 됩니다.\n"
             "Local LLM 기본 주소는 LM Studio 호환 http://127.0.0.1:1234/v1 입니다.\n"
             "NVIDIA NIM은 private context가 외부로 전송되므로 동의 체크가 필수입니다.\n"
             "API key와 원문 메시지는 결과 JSON에 저장되지 않습니다.",
