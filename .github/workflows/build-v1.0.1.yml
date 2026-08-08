@@ -44,7 +44,10 @@ jobs:
       - name: Run tests
         id: tests
         continue-on-error: true
-        run: pytest -q
+        shell: pwsh
+        run: |
+          pytest -q --tb=short 2>&1 | Tee-Object -FilePath pytest-output.txt
+          exit $LASTEXITCODE
 
       - name: Import GUI entry point
         id: import_gui
@@ -81,6 +84,7 @@ jobs:
         uses: actions/github-script@v7
         with:
           script: |
+            const fs = require('fs');
             const entries = [
               ['v1.0.1-tests', '${{ steps.tests.outcome }}', 'pytest'],
               ['v1.0.1-gui-import', '${{ steps.import_gui.outcome }}', 'GUI import'],
@@ -97,6 +101,21 @@ jobs:
                 context: contextName,
                 description: ok ? `${label} passed` : `${label} outcome: ${outcome}`
               });
+            }
+            if ('${{ steps.tests.outcome }}' !== 'success' && fs.existsSync('pytest-output.txt')) {
+              const lines = fs.readFileSync('pytest-output.txt', 'utf8').split(/\r?\n/);
+              const failed = lines.filter(line => line.startsWith('FAILED ')).slice(0, 6);
+              for (const line of failed) {
+                const short = line.replace(/^FAILED\s+/, '').replace(/\s+-\s+.*/, '').slice(0, 80);
+                await github.rest.repos.createCommitStatus({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  sha: context.sha,
+                  state: 'failure',
+                  context: `test-fail|${short}`,
+                  description: 'pytest failure'
+                });
+              }
             }
             const allOk = entries.every(([, outcome]) => outcome === 'success');
             await github.rest.repos.createCommitStatus({
