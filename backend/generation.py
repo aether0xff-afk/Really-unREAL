@@ -48,10 +48,21 @@ def generation_prompt(packet: GenerationContextPacket) -> str:
     """Render a provider-independent prompt from a leakage-safe packet."""
 
     payload = json.dumps(packet.to_dict(), ensure_ascii=False, indent=2)
+    if packet.action_role_ambiguous:
+        action_rule = (
+            "- A long silence makes REPLY vs INITIATE ambiguous. chosen_action is only "
+            "an observable sender-order proxy; do not infer hidden intent from it."
+        )
+    else:
+        action_rule = (
+            "- The temporal policy has already chosen the action. Do not decide to WAIT "
+            "or change the action."
+        )
+
     return f"""You generate only the observable message burst for a conversation simulator.
 
 Rules:
-- The temporal policy has already chosen the action. Do not decide to WAIT or change the action.
+{action_rule}
 - Reproduce plausible observable writing behavior from the supplied evidence.
 - Retrieved examples describe similar *situations and response shape*. Do not reconstruct or copy a historical response verbatim.
 - Prefer the current visible context over superficial lexical similarity to an old example.
