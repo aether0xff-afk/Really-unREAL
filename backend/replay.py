@@ -156,6 +156,36 @@ def _target_burst_end(
     return end
 
 
+def _adjacent_action(
+    *,
+    conversation: EvidenceConversation,
+    target_person_id: str,
+    previous_sender_person_id: str,
+    self_person_id: str,
+) -> Action | None:
+    """Infer the coarse action role without assuming target != self.
+
+    In a direct conversation, there is only one counterpart to the target. A
+    resolved message from that counterpart is therefore a REPLY cue regardless
+    of whether the target is another person or the user's own SELF_TWIN. A
+    second target burst after the target's own previous burst is the observable
+    INITIATE/follow-up proxy.
+
+    Group replay remains conservative: only an explicit reply to ``self`` can be
+    labelled for an other-person twin. SELF_TWIN group action labels are skipped
+    because an adjacent third-party message is not enough to identify whom the
+    user's message was addressing.
+    """
+
+    if previous_sender_person_id == target_person_id:
+        return Action.INITIATE
+    if conversation.context in _DIRECT_CONTEXTS:
+        return Action.REPLY
+    if target_person_id != self_person_id and previous_sender_person_id == self_person_id:
+        return Action.REPLY
+    return None
+
+
 def build_replay_cases(
     evidence: PersonEvidence,
     *,
@@ -171,12 +201,14 @@ def build_replay_cases(
     Group conversations remain useful persona evidence but are not reliable
     labels for whether the target was responding to *the user*.
 
-    For events inside one active session, REPLY means the immediately preceding
-    observed message was sent by ``self_person_id`` and INITIATE is the coarse
-    follow-up proxy when the target sends again after its own previous burst.
-    After a long session gap, adjacent sender order is not enough to distinguish
-    late reply from genuinely new initiation. Those cases are retained for
-    timing/content replay but marked ``action_is_ambiguous``.
+    Direct-conversation labels are target-relative rather than user-relative, so
+    the exact same replay builder supports both another-person twin and a
+    SELF_TWIN. Inside one active session, a message after the counterpart is a
+    REPLY; a new burst after the target's own previous burst is the coarse
+    INITIATE/follow-up proxy. After a long session gap, adjacent sender order is
+    not enough to distinguish late reply from genuinely new initiation. Those
+    cases are retained for timing/content replay but marked
+    ``action_is_ambiguous``.
     """
 
     if context_size < 1:
@@ -228,13 +260,13 @@ def build_replay_cases(
                 index = burst_end
                 continue
 
-            if previous.sender_person_id == self_person_id:
-                action = Action.REPLY
-            elif previous.sender_person_id == evidence.person_id:
-                action = Action.INITIATE
-            else:
-                # In an explicitly included group conversation this is a reply
-                # to someone else, not a trustworthy user-relationship label.
+            action = _adjacent_action(
+                conversation=conversation,
+                target_person_id=evidence.person_id,
+                previous_sender_person_id=previous.sender_person_id,
+                self_person_id=self_person_id,
+            )
+            if action is None:
                 index = burst_end
                 continue
 
