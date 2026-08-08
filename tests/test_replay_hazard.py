@@ -1,3 +1,4 @@
+from dataclasses import replace
 from datetime import datetime, timedelta
 
 from backend.fusion import EvidenceContext, EvidenceMessage
@@ -5,6 +6,7 @@ from backend.models import ChatMessage
 from backend.replay import ReplayCase, build_action_snapshots
 from backend.replay_hazard import (
     DiscreteHazardModel,
+    _message_kind,
     evaluate_hazard_model,
     select_temporal_model,
 )
@@ -44,7 +46,12 @@ def _case(
         "target",
         "held out",
     )
-    action = Action.REPLY if previous_person_id == "self" else Action.INITIATE
+    if previous_person_id == "self":
+        action = Action.REPLY
+    elif delay_seconds > 21600:
+        action = Action.INITIATE
+    else:
+        action = Action.FOLLOW_UP
     return ReplayCase(
         case_id=case_id,
         person_id="target",
@@ -63,6 +70,15 @@ def _case(
         burst_size=1,
         session_restart=delay_seconds > 21600,
     )
+
+
+def test_hazard_uses_same_korean_question_classifier_as_live_timing() -> None:
+    case = _case("question", delay_seconds=300, prior_gap_seconds=30)
+    question = replace(
+        case,
+        context=(case.context[0], _evidence(BASE, "self", "몇시에 감")),
+    )
+    assert _message_kind(question) == "question"
 
 
 def test_hazard_uses_visible_conversation_activity_to_separate_timing() -> None:
@@ -105,7 +121,9 @@ def test_hazard_prediction_never_reads_held_out_target_text() -> None:
         delay_lower_seconds=original.delay_lower_seconds,
         delay_upper_seconds=original.delay_upper_seconds,
         context=original.context,
-        target_burst=(_evidence(original.action_at, "target", "completely different future"),),
+        target_burst=(
+            _evidence(original.action_at, "target", "completely different future"),
+        ),
         burst_size=1,
         session_restart=original.session_restart,
     )
