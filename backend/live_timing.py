@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Iterable, Sequence
 
-from backend.fusion import EvidenceContext, EvidenceMessage
+from backend.fusion import EvidenceMessage
 from backend.replay import ReplayCase, chronological_split
 from backend.replay_hazard import DiscreteHazardModel, select_temporal_model
 from backend.simulation.action_policy import Action
@@ -17,6 +17,7 @@ class LiveTimingFeatures:
     weekend: int
     recent_activity: str
     previous_gap: str
+    last_message_kind: str
 
 
 def _activity_bucket(count: int) -> str:
@@ -43,6 +44,18 @@ def _gap_bucket(seconds: float | None) -> str:
     return ">2h"
 
 
+def _message_kind(context: Sequence[EvidenceMessage]) -> str:
+    if not context:
+        return "none"
+    text = context[-1].message.text.strip()
+    if "?" in text:
+        return "question"
+    compact = "".join(text.split())
+    if len(compact) <= 4:
+        return "very_short"
+    return "statement"
+
+
 def visible_timing_features(
     observed_at: datetime,
     context: Sequence[EvidenceMessage],
@@ -60,6 +73,7 @@ def visible_timing_features(
         weekend=int(observed_at.weekday() >= 5),
         recent_activity=_activity_bucket(recent),
         previous_gap=_gap_bucket(previous_gap),
+        last_message_kind=_message_kind(context),
     )
 
 
@@ -78,13 +92,12 @@ def _observable_action(case: ReplayCase) -> Action:
 
 
 class ContextualLiveTimingSampler:
-    """Deploy timing from observable current context, with conservative backoff.
+    """Deploy live timing from observable current context with safe backoff.
 
-    When held-out validation shows that the discrete hazard model improves over
-    the median baseline, live sampling uses a hazard refit on all historical REAL
-    cases. Sparse relationships still receive context conditioning through a
-    non-parametric hierarchy that matches time-of-day, weekend, recent activity,
-    previous visible-message gap, relationship and action before backing off.
+    Fine-grained empirical cells can condition on the visible message itself
+    (question / very short / statement) when at least a few matching historical
+    events exist. Otherwise the policy uses the validation-gated discrete hazard
+    model, then progressively broader relationship/action empirical backoff.
     """
 
     def __init__(
@@ -134,6 +147,31 @@ class ContextualLiveTimingSampler:
         upper = max(lower, float(chosen.delay_upper_seconds))
         return lower if lower == upper else self._rng.uniform(lower, upper)
 
+    def _confident_action_cases(self, action: Action) -> list[ReplayCase]:
+        return [
+            case
+            for case in self.cases
+            if not case.action_is_ambiguous
+            and _observable_action(case) == action
+        ]
+
+    def _exact_context_candidates(
+        self,
+        *,
+        conversation_id: str,
+        action: Action,
+        observed_at: datetime,
+        visible_context: Sequence[EvidenceMessage],
+    ) -> list[ReplayCase]:
+        live = visible_timing_features(observed_at, visible_context)
+        pool = [
+            case
+            for case in self._confident_action_cases(action)
+            if case.conversation_id == conversation_id
+            and _historical_features(case) == live
+        ]
+        return pool if len(pool) >= self.minimum_context_events else []
+
     def _contextual_candidates(
         self,
         *,
@@ -144,12 +182,7 @@ class ContextualLiveTimingSampler:
         visible_context: Sequence[EvidenceMessage],
     ) -> list[ReplayCase]:
         live = visible_timing_features(observed_at, visible_context)
-        confident = [
-            case
-            for case in self.cases
-            if not case.action_is_ambiguous
-            and _observable_action(case) == action
-        ]
+        confident = self._confident_action_cases(action)
         if not confident:
             return []
 
@@ -160,19 +193,21 @@ class ContextualLiveTimingSampler:
             [
                 case for case in confident
                 if case.conversation_id == conversation_id
-                and feat(case) == live
-            ],
-            [
-                case for case in confident
-                if case.conversation_id == conversation_id
                 and feat(case).hour_band == live.hour_band
                 and feat(case).recent_activity == live.recent_activity
                 and feat(case).previous_gap == live.previous_gap
+                and feat(case).last_message_kind == live.last_message_kind
             ],
             [
                 case for case in confident
                 if case.conversation_id == conversation_id
                 and feat(case).recent_activity == live.recent_activity
+                and feat(case).last_message_kind == live.last_message_kind
+            ],
+            [
+                case for case in confident
+                if case.conversation_id == conversation_id
+                and feat(case).last_message_kind == live.last_message_kind
             ],
             [case for case in confident if case.conversation_id == conversation_id],
             [
@@ -180,13 +215,12 @@ class ContextualLiveTimingSampler:
                 if case.platform == platform
                 and feat(case).hour_band == live.hour_band
                 and feat(case).recent_activity == live.recent_activity
+                and feat(case).last_message_kind == live.last_message_kind
             ],
             [case for case in confident if case.platform == platform],
             confident,
         ]
         for index, pool in enumerate(levels):
-            # Fine context levels need a few observations; relationship/action
-            # and broader fallbacks are allowed even when sparse.
             if pool and (index >= 3 or len(pool) >= self.minimum_context_events):
                 return pool
         return []
@@ -208,13 +242,12 @@ class ContextualLiveTimingSampler:
             return None
         if action == Action.INITIATE and last_sender != self.person_id:
             return None
-        evidence_context = context[-1].context
         return ReplayCase(
             case_id=f"live-timing:{conversation_id}:{observed_at.isoformat()}:{action.value}",
             person_id=self.person_id,
             platform=platform,
             conversation_id=conversation_id,
-            evidence_context=evidence_context,
+            evidence_context=context[-1].context,
             evidence_weight=1.0,
             action=action,
             observation_end=observed_at,
@@ -242,6 +275,17 @@ class ContextualLiveTimingSampler:
             return None
         observed_at = observed_at or datetime.now()
 
+        # If the same relationship has enough exact observable-context evidence,
+        # use it directly. This is where question-vs-statement timing can matter.
+        exact = self._exact_context_candidates(
+            conversation_id=conversation_id,
+            action=action,
+            observed_at=observed_at,
+            visible_context=visible_context,
+        )
+        if exact:
+            return self._sample_case(exact)
+
         if self._hazard is not None:
             live_case = self._live_case(
                 platform=platform,
@@ -251,10 +295,13 @@ class ContextualLiveTimingSampler:
                 visible_context=visible_context,
             )
             if live_case is not None:
-                return max(0.0, self._hazard.sample_delay_seconds(
-                    live_case,
-                    seed=self._rng.randrange(0, 2**32),
-                ))
+                return max(
+                    0.0,
+                    self._hazard.sample_delay_seconds(
+                        live_case,
+                        seed=self._rng.randrange(0, 2**32),
+                    ),
+                )
 
         candidates = self._contextual_candidates(
             platform=platform,
