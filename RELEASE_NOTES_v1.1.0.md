@@ -32,4 +32,6 @@ Really-unREAL 1.1 turns the first live-chat desktop prototype into a more cohere
 
 ## Windows release gate
 
-The final workflow must pass Python tests, integrated GUI imports, PyInstaller one-file build, packaged EXE smoke, synthetic NVIDIA NIM smoke, portable ZIP packaging, and release creation before publishing `v1.1.0`.
+The required artifact gate covers the full Python regression/provider-contract tests, integrated GUI imports, PyInstaller one-file build, execution of the packaged EXE smoke path, portable ZIP packaging, and GitHub Release creation.
+
+Hosted NVIDIA NIM is also probed with bounded retries and reported as a separate external-health status. A current third-party outage does **not** invalidate or block an otherwise verified Windows artifact; in the live runtime, provider failures likewise preserve the already-scheduled simulated behavior and retry generation separately.
