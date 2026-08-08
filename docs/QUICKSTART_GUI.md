@@ -1,45 +1,32 @@
-# Really-unREAL 1.1 GUI Quick Start
+# Really-unREAL 1.2 GUI Quick Start
 
-The desktop UI provides a simple first-run path without editing `identity.local.json` or typing long CLI commands.
+The desktop UI lets you load KakaoTalk exports and use the replay/live simulator without editing identity JSON by hand.
 
 ## Windows portable build
 
-1. Download the latest `Really-unREAL-*-Windows-x64.zip` release asset.
-2. Extract it. It contains `Really-unREAL.exe` and this quick-start guide; no Python installation is required.
-3. Run `Really-unREAL.exe`.
-4. Windows SmartScreen may warn about an unsigned community build. Check that the file came from this repository's GitHub Release.
+1. Download `Really-unREAL-v1.2.0-Windows-x64.zip` from the GitHub Release.
+2. Extract it and run `Really-unREAL.exe`.
+3. SmartScreen may warn because the community binary is unsigned.
 
-The app does not install a service and never sends messages to KakaoTalk, Instagram, or any other real platform.
+The app never sends a message to KakaoTalk, Instagram, or another real messaging platform.
 
-## 1. Export and load KakaoTalk data
+## 1. Load KakaoTalk ZIPs
 
-Choose **여러 ZIP 선택**. You can select one or many individual KakaoTalk chat ZIPs, and each selected ZIP may itself be an outer bundle containing several chat exports.
+Choose **여러 ZIP 선택**. Ctrl selects individual files and Shift selects a range. One selected ZIP may also be an outer bundle containing several exports. Exact duplicate conversations are de-duplicated.
 
-On Windows, use **Ctrl** to pick individual files or **Shift** to select a range. Exact duplicate conversations are removed so accidental duplicate selection does not double-count evidence.
+Confirm **내 이름**, then choose **대화 상대**.
 
-After loading, confirm the suggested **내 이름** and choose **대화 상대**.
+## 2. 빠른 진단
 
-## 2. 빠른 진단 — LLM 없음
+No LLM is called. This checks parsing, self/target mapping, replay availability, and timing-model data.
 
-**빠른 진단 (LLM 없음)** does not generate a reply. It checks that the selected data can build the replay dataset and reply-timing model.
+## 3. 모델 테스트
 
-Use it to check whether the exports parsed correctly, the self/target mapping is usable, enough history exists, and a relationship-specific timing model can be built. No model API is called.
+**모델 테스트 · Local LLM** and **모델 테스트 · NVIDIA NIM** hide real historical continuations and evaluate the reconstruction using only older evidence.
 
-## 3. 모델 테스트 — Historical Replay benchmark
+The UI keeps content overlap, endings, message splitting, expression behavior and timing separate. Timing is evaluated independently of provider generation success. Mean metrics use small-sample Student-t intervals and binary match rates use Wilson intervals.
 
-**모델 테스트 · Local LLM** and **모델 테스트 · NVIDIA NIM** are evaluation modes, not chat modes.
-
-Really-unREAL hides real historical continuations, asks the model to reproduce them using only older evidence, and then evaluates separate observable dimensions:
-
-- character-pattern and token overlap;
-- ending/style overlap;
-- message-burst splitting;
-- laughter/cry/question behavior;
-- reply timing falling inside the feasible historical interval.
-
-When enough cases exist the GUI shows descriptive 95% intervals. A point estimate from a tiny sample must not be treated as an overall fidelity score.
-
-**NVIDIA defaults to 3 cases only as a quick smoke check.** For actual model comparison, raise **테스트 수** to at least 10–20 when time/API budget allows. Use **결과 저장** for the full numeric JSON.
+The NVIDIA default of **3 cases is only a smoke check**. Use roughly 10–20+ held-out cases for comparisons when practical.
 
 ### Local model
 
@@ -49,67 +36,67 @@ Default OpenAI-compatible endpoint:
 http://127.0.0.1:1234/v1
 ```
 
-This works with local runtimes such as LM Studio when their OpenAI-compatible server is enabled.
-
 ### NVIDIA NIM
 
-Default model:
+Default hosted model:
 
 ```text
 nvidia/nemotron-3-ultra-550b-a55b
 ```
 
-Hosted inference sends cutoff-safe private conversation context to NVIDIA. Paste the API key only for the current run and check the explicit remote-context consent box. The GUI does not write the API key into result files.
+Hosted inference sends cutoff-safe private prompt context to NVIDIA. It therefore requires the explicit remote-context consent checkbox. The API key is not written into benchmark result files.
 
-## 4. 대화 시작 — live SIMULATION
+## 4. 대화 시작 — Live SIMULATION
 
-Select **Local LLM** or **NVIDIA NIM**, then press **대화 시작**.
+1. Your message is stored as `SIMULATION` only.
+2. The relationship behavior policy first chooses **REPLY or WAIT**. WAIT means no reply event is created.
+3. If a reply exists, an inferred **READ** event and a separate **REPLY** event can occur at different times.
+4. Only message actions call the LLM; READ never calls it.
+5. After a target message, the simulator separately considers a same-session **FOLLOW_UP**, a later new-session **INITIATE**, or silence.
 
-A separate messenger-like window opens for the selected person. Messages typed there are simulation input only; they are not sent to a real messaging service.
+### Rapid user bubbles
 
-### What happens after you send a message
+Sending `야` → `뭐함` → `ㅋㅋ` quickly no longer re-rolls the person's reply timer each time. A future unclaimed reply keeps its sampled clock; only a small settle floor prevents generation in the middle of rapid typing.
 
-1. Your input is recorded as `SIMULATION`.
-2. The live behavior model looks at observable context: relationship, clock time, weekday/weekend, recent activity, previous gap, and—when enough evidence exists—whether the current message is a question, very short message, or statement.
-3. A stochastic `REPLY` time is scheduled from historical behavior; it is not a fixed 30-second timer.
-4. The chat window displays the countdown.
-5. Only when the behavior time arrives is the language model called.
-6. Generation uses the current visible conversation, relationship-focused style/burst profiles, cutoff-safe memory/retrieval, and at most two older REAL replies as private style exemplars.
-7. A guard retries generation if a long output is suspiciously close to one of those historical exemplars.
-8. After a reply, an optional `INITIATE` event may be scheduled from historical behavior.
+If an earlier bubble was already marked `읽음 추정` and you send another before the reply, the later bubble gets its own inferred READ opportunity.
 
-### What if NVIDIA/local inference fails?
+### Read indicator
 
-Provider availability does **not** decide whether the simulated person wanted to reply.
+`안읽음 추정` / `읽음 추정 · HH:MM` are **simulation inference**, not real KakaoTalk read receipts. Kakao exports do not contain true read timestamps.
 
-- Temporary HTTP 429/5xx, timeout or network failure: the original reply behavior time is preserved; generation delivery retries separately with backoff.
-- Configuration/credential/invalid-format failure: the action is kept as blocked instead of silently deleted. Fix the provider setting and choose **생성 재시도**.
-- A retry never gets to read real/simulated messages that arrived after the original behavior time merely because the provider was down.
+### Provider failures
 
-Pending events and simulated messages are persisted in a local SQLite database. **새 대화** clears only SIMULATION state; imported REAL evidence is never deleted by that button.
+The person's modeled behavior and the provider delivery clock are separate.
+
+- temporary 429/5xx/timeout/network failure → exact event becomes `RETRY`; original behavior time stays immutable;
+- credential/config/invalid response failure → exact event becomes `BLOCKED`;
+- retries cannot see messages after the original modeled behavior cutoff;
+- a later user message cannot cancel a generation that was already atomically claimed;
+- stale claims recover after restart.
+
+### Multiple windows / crashes
+
+Due events are atomically claimed in SQLite. A second app/window cannot generate the same event simultaneously. Generated messages and `PROCESSED` completion are committed together. Resetting while a generation is in flight prevents stale output from reappearing in the new simulation session.
+
+### Message splitting
+
+Multi-bubble generated responses use observed REAL target-burst spacing when available rather than a fake fixed one-second gap.
 
 ## Privacy boundaries
 
-- raw archives stay on the local machine;
-- imported evidence remains `REAL`;
-- user-entered live messages and generated live messages are `SIMULATION`;
-- simulation output is never promoted into asserted real history;
+- imported evidence is `REAL`;
+- user-entered and generated live messages are `SIMULATION`;
+- SIMULATION never becomes asserted REAL history;
+- raw archives remain local unless you explicitly use a hosted inference route;
 - hosted/private-context routes require explicit consent;
-- no real messaging-platform sending API is called;
-- historical raw message text is not printed in benchmark results;
-- live style exemplars are prompt-time private context only and are not written to public result JSON or release artifacts.
+- no real messaging-platform send API is called;
+- live style exemplars are private prompt-time evidence and are not written to public result JSON/release artifacts.
 
 ## Important interpretation limit
 
-Really-unREAL 1.1 uses a general language model conditioned by person-specific observable evidence. It does **not** claim that the base LLM itself has been neurally fine-tuned into that person, nor that replay similarity reconstructs hidden identity or mental state.
-
-## Advanced CLI
-
-Use the existing CLI for Instagram/Kakao identity fusion, SELF twin experiments, dense retrieval ablations, closed-loop Shadow Simulation, custom identity maps, and full benchmark configuration.
+Really-unREAL 1.2 still uses a general language model conditioned by person-specific observable evidence. It does not claim neural fine-tuning into a person or reconstruction of hidden mental state.
 
 ## Build from source
-
-Python 3.11+ is required.
 
 ```bash
 python -m pip install -e '.[dev,build]'
