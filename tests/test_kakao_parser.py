@@ -18,6 +18,8 @@ def test_parses_bracket_export_and_multiline_message() -> None:
     assert messages[1].sender == "상대"
     assert messages[1].text == "왜ㅋㅋ\n두번째 줄"
     assert messages[2].timestamp == datetime(2026, 8, 7, 0, 5)
+    assert messages[0].metadata["platform"] == "kakao"
+    assert messages[0].metadata["timestamp_precision_seconds"] == 60.0
 
 
 def test_parses_inline_export() -> None:
