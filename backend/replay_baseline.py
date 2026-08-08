@@ -62,6 +62,18 @@ def _observable_candidate_action(case: ReplayCase) -> Action:
     return Action.REPLY
 
 
+def _representative_training_delay_seconds(case: ReplayCase) -> float:
+    """Use the center of the observed timing interval for empirical fitting.
+
+    KakaoTalk timestamps are minute-precision. Treating a same-minute reply as
+    literal 0 seconds makes the empirical model learn an artificial immediate-
+    reply spike. The interval midpoint is a simple non-parametric representative
+    for this floor baseline; interval-aware evaluation still uses the full range.
+    """
+
+    return (case.delay_lower_seconds + case.delay_upper_seconds) / 2.0
+
+
 def _interval_error_seconds(prediction: float, case: ReplayCase) -> float:
     if prediction < case.delay_lower_seconds:
         return case.delay_lower_seconds - prediction
@@ -77,6 +89,9 @@ class EmpiricalTimingBaseline:
     conditioned on the *observable* next-action type and, when enough samples
     exist, platform. Evidence weights make KakaoTalk primary and Instagram
     supplemental without duplicating data.
+
+    Coarse timestamp observations are fitted with the center of their feasible
+    delay interval rather than a fake exact timestamp.
 
     The baseline is not expected to be the final timing model. It exists so a
     later survival/hazard model has a concrete held-out benchmark to beat.
@@ -112,7 +127,7 @@ class EmpiricalTimingBaseline:
             raise ValueError("minimum_bucket_events must be >= 1")
 
         global_samples = [
-            (case.observed_delay_seconds, case.evidence_weight)
+            (_representative_training_delay_seconds(case), case.evidence_weight)
             for case in cases
         ]
         global_threshold = _weighted_quantile(global_samples, quantile)
@@ -120,7 +135,7 @@ class EmpiricalTimingBaseline:
         action_thresholds: dict[Action, float] = {}
         for action in (Action.REPLY, Action.INITIATE):
             bucket = [
-                (case.observed_delay_seconds, case.evidence_weight)
+                (_representative_training_delay_seconds(case), case.evidence_weight)
                 for case in cases
                 if _observable_candidate_action(case) == action
             ]
@@ -132,7 +147,7 @@ class EmpiricalTimingBaseline:
         for case in cases:
             action = _observable_candidate_action(case)
             buckets.setdefault((case.platform, action), []).append(
-                (case.observed_delay_seconds, case.evidence_weight)
+                (_representative_training_delay_seconds(case), case.evidence_weight)
             )
         for key, bucket in buckets.items():
             if len(bucket) >= minimum_bucket_events:
