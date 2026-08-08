@@ -6,6 +6,10 @@ on:
     branches: [main]
     paths:
       - ".github/workflows/nvidia-smoke.yml"
+      - "backend/nvidia_conversation_smoke.py"
+      - "backend/providers/nvidia.py"
+      - "backend/generation.py"
+      - "backend/generation_context.py"
 
 permissions:
   contents: read
@@ -14,7 +18,7 @@ permissions:
 jobs:
   hosted-nim-smoke:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 8
     env:
       NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
     steps:
@@ -38,20 +42,58 @@ jobs:
         if: steps.secret.outcome == 'success'
         continue-on-error: true
         run: python -m backend.nvidia_smoke
-      - name: Publish readable commit status
+      - name: Run four-turn project conversation
+        id: conversation
+        if: steps.secret.outcome == 'success' && steps.smoke.outcome == 'success'
+        continue-on-error: true
+        env:
+          RESULT_PATH: nvidia-conversation-smoke.json
+        run: python -m backend.nvidia_conversation_smoke
+      - name: Upload synthetic conversation result
+        if: steps.conversation.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: nvidia-conversation-smoke
+          path: nvidia-conversation-smoke.json
+          retention-days: 1
+      - name: Publish readable commit statuses
         if: always()
         uses: actions/github-script@v7
         with:
           script: |
-            const success = '${{ steps.secret.outcome }}' === 'success' && '${{ steps.smoke.outcome }}' === 'success';
+            const fs = require('fs');
+            const smokeSuccess = '${{ steps.secret.outcome }}' === 'success' && '${{ steps.smoke.outcome }}' === 'success';
+            const conversationSuccess = '${{ steps.conversation.outcome }}' === 'success';
             await github.rest.repos.createCommitStatus({
               owner: context.repo.owner,
               repo: context.repo.repo,
               sha: context.sha,
-              state: success ? 'success' : 'failure',
+              state: smokeSuccess ? 'success' : 'failure',
               context: 'nvidia-nim-smoke',
-              description: success ? 'Hosted NVIDIA NIM smoke passed' : 'Hosted NVIDIA NIM smoke failed'
+              description: smokeSuccess ? 'Hosted NVIDIA NIM smoke passed' : 'Hosted NVIDIA NIM smoke failed'
             });
+            await github.rest.repos.createCommitStatus({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              sha: context.sha,
+              state: conversationSuccess ? 'success' : 'failure',
+              context: 'nvidia-conversation-smoke',
+              description: conversationSuccess ? 'Four-turn project conversation passed' : 'Four-turn project conversation failed'
+            });
+            if (conversationSuccess && fs.existsSync('nvidia-conversation-smoke.json')) {
+              const data = JSON.parse(fs.readFileSync('nvidia-conversation-smoke.json', 'utf8'));
+              for (const turn of data.turns) {
+                const text = (turn.target || []).join(' / ').slice(0, 130) || '(empty)';
+                await github.rest.repos.createCommitStatus({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  sha: context.sha,
+                  state: 'success',
+                  context: `nvidia-turn-${turn.turn}`,
+                  description: text
+                });
+              }
+            }
       - name: Fail job when smoke failed
-        if: always() && (steps.secret.outcome != 'success' || steps.smoke.outcome != 'success')
+        if: always() && (steps.secret.outcome != 'success' || steps.smoke.outcome != 'success' || steps.conversation.outcome != 'success')
         run: exit 1
