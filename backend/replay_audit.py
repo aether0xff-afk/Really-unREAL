@@ -21,6 +21,7 @@ from backend.replay_hazard import (
     evaluate_hazard_model,
     select_temporal_model,
 )
+from backend.twin import TwinMode, resolve_twin_spec
 
 
 def main() -> None:
@@ -30,14 +31,23 @@ def main() -> None:
     parser.add_argument("kakao_archive")
     parser.add_argument("instagram_archive")
     parser.add_argument("identity_map")
-    parser.add_argument("person_id")
+    parser.add_argument(
+        "person_id",
+        nargs="?",
+        help="Target person ID for PERSON mode. Omit with --self-twin.",
+    )
+    parser.add_argument(
+        "--self-twin",
+        action="store_true",
+        help="Audit the identity map's is_self=true person as the replay target",
+    )
     parser.add_argument("--context-size", type=int, default=30)
     parser.add_argument("--burst-gap-seconds", type=float, default=120.0)
     parser.add_argument("--session-gap-hours", type=float, default=6.0)
     parser.add_argument(
         "--include-group",
         action="store_true",
-        help="Include only user-addressable labels from group conversations",
+        help="Include only trustworthy target-relative labels from group conversations",
     )
     parser.add_argument(
         "--baseline-quantile",
@@ -48,23 +58,26 @@ def main() -> None:
     args = parser.parse_args()
 
     identities = IdentityMap.from_json(args.identity_map)
-    self_person_id = identities.self_person_id
-    if self_person_id is None:
-        raise SystemExit(
-            "identity map must mark exactly one person with is_self=true before replay"
+    try:
+        spec = resolve_twin_spec(
+            identities,
+            mode=TwinMode.SELF if args.self_twin else TwinMode.PERSON,
+            person_id=args.person_id,
         )
+    except (KeyError, ValueError) as exc:
+        raise SystemExit(str(exc)) from exc
 
     kakao = load_kakao_archive(args.kakao_archive)
     instagram = load_instagram_export(args.instagram_archive)
     evidence = collect_person_evidence(
-        args.person_id,
+        spec.target_person_id,
         identities,
         kakao_conversations=kakao,
         instagram_threads=instagram.threads,
     )
     cases = build_replay_cases(
         evidence,
-        self_person_id=self_person_id,
+        self_person_id=spec.self_person_id,
         context_size=args.context_size,
         burst_gap_seconds=args.burst_gap_seconds,
         session_gap_hours=args.session_gap_hours,
@@ -138,7 +151,8 @@ def main() -> None:
             }
 
     output: dict[str, object] = {
-        "person_id": args.person_id,
+        "twin_mode": spec.mode.value,
+        "target_person_id": spec.target_person_id,
         "include_group": args.include_group,
         "audit": audit_replay(cases, snapshots).to_dict(),
         "split": (
