@@ -1,6 +1,7 @@
 from datetime import datetime, timedelta
 import urllib.error
 
+from backend.fusion import EvidenceContext, EvidenceMessage
 from backend.generation import GeneratedBurst
 from backend.gui_live import LiveChatSession
 from backend.gui_support import LOCAL_BASE_URL
@@ -56,7 +57,6 @@ def test_nvidia_503_is_classified_as_transient() -> None:
         max_attempts=1,
     )
 
-    # Any packet is fine here because the transport fails before parsing.
     from tests.test_nvidia_provider import _packet
 
     try:
@@ -84,12 +84,14 @@ def test_transient_failure_preserves_reply_and_retries_later(tmp_path) -> None:
 
     sent_at = BASE + timedelta(days=1)
     event = session.send_user_message("오랜만", now=sent_at)
+    original_due_at = event.due_at
     assert event.action == Action.REPLY
 
+    failed_at = event.due_at + timedelta(seconds=1)
     try:
-        session.process_due(now=event.due_at + timedelta(seconds=1))
+        session.process_due(now=failed_at)
     except TransientGenerationError as exc:
-        deferred = session.defer_generation_failure(exc, now=event.due_at + timedelta(seconds=1))
+        deferred = session.defer_generation_failure(exc, now=failed_at)
     else:
         raise AssertionError("first generation should fail")
 
@@ -97,15 +99,81 @@ def test_transient_failure_preserves_reply_and_retries_later(tmp_path) -> None:
     assert deferred.event_id == event.event_id
     assert deferred.status == "RETRY"
     assert deferred.generation_attempts == 1
+    assert deferred.due_at == original_due_at
+    assert deferred.ready_at > original_due_at
     assert session.pending_event() is not None
     assert session.pending_event().event_id == event.event_id
     assert not any(message.text == "살아남은 답장" for message in session.chat_messages())
 
-    emissions = session.process_due(now=deferred.due_at + timedelta(seconds=1))
+    # Before the provider retry clock is ready, the event is not due even though
+    # the person's original behavior time has already passed.
+    assert session.process_due(now=deferred.ready_at - timedelta(milliseconds=1)) == []
+
+    emissions = session.process_due(now=deferred.ready_at + timedelta(seconds=1))
     assert len(emissions) == 1
     assert emissions[0].event_id == event.event_id
+    assert emissions[0].due_at == original_due_at
     assert emissions[0].burst.messages == ("살아남은 답장",)
     assert any(message.text == "살아남은 답장" for message in session.chat_messages())
+
+
+def test_provider_retry_does_not_see_context_after_original_behavior_time(tmp_path) -> None:
+    session = LiveChatSession(
+        [_conversation()],
+        self_alias="나",
+        target_alias="친구",
+        provider="local",
+        model="fake-local",
+        base_url=LOCAL_BASE_URL,
+        api_key=None,
+        allow_remote_private_context=False,
+        store_path=tmp_path / "causal-retry.db",
+    )
+
+    class InspectRetryModel:
+        model = "inspect"
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def generate_burst(self, packet):
+            self.calls += 1
+            if self.calls == 1:
+                raise TransientGenerationError("temporary")
+            assert "AFTER_ORIGINAL_DUE" not in str(packet.to_dict())
+            return GeneratedBurst(("ok",))
+
+    model = InspectRetryModel()
+    session.engine.language_model = model
+    event = session.send_user_message("질문", now=BASE + timedelta(days=1))
+    failed_at = event.due_at + timedelta(seconds=1)
+    try:
+        session.process_due(now=failed_at)
+    except TransientGenerationError as exc:
+        deferred = session.defer_generation_failure(exc, now=failed_at)
+    else:
+        raise AssertionError("first generation should fail")
+
+    assert deferred is not None
+    late = EvidenceMessage(
+        message=ChatMessage(
+            event.due_at + timedelta(seconds=2),
+            "self",
+            "AFTER_ORIGINAL_DUE",
+        ),
+        platform="kakao",
+        conversation_id=session.conversation_id,
+        context=EvidenceContext.KAKAO_DIRECT,
+        sender_person_id="self",
+        evidence_weight=1.0,
+    )
+    visible = session._visible_context() + (late,)
+    emissions = session.engine.process_due(
+        now=deferred.ready_at + timedelta(seconds=1),
+        visible_context=visible,
+    )
+    assert emissions[0].due_at == event.due_at
+    assert emissions[0].burst.messages == ("ok",)
 
 
 def test_existing_pre_1_1_database_is_migrated(tmp_path) -> None:
@@ -130,8 +198,9 @@ def test_existing_pre_1_1_database_is_migrated(tmp_path) -> None:
 
     from backend.simulation.store import SQLiteSimulationStore
 
-    store = SQLiteSimulationStore(path)
+    SQLiteSimulationStore(path)
     with sqlite3.connect(path) as db:
         columns = {row[1] for row in db.execute("PRAGMA table_info(scheduled_events)")}
     assert "generation_attempts" in columns
     assert "last_error" in columns
+    assert "next_attempt_at" in columns

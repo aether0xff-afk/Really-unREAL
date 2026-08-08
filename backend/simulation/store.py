@@ -23,19 +23,29 @@ class ScheduledEvent:
     platform: str
     conversation_id: str
     action: Action
+    # due_at is the simulated person's behavior time and is immutable after
+    # scheduling. Provider retries must never rewrite it.
     due_at: datetime
     created_at: datetime
     status: str
     generation_attempts: int = 0
     last_error: str | None = None
+    next_attempt_at: datetime | None = None
+
+    @property
+    def ready_at(self) -> datetime:
+        """Clock time when generation may next be attempted."""
+
+        return self.next_attempt_at or self.due_at
 
 
 class SQLiteSimulationStore:
     """Durable local state for live/shadow simulation.
 
-    Scheduled behavior exists independently from provider availability. Temporary
-    generation failures move an event to RETRY; permanent/configuration failures
-    move it to BLOCKED. Neither state silently erases the already-decided action.
+    `due_at` represents observable simulated behavior. `next_attempt_at` is only
+    provider-delivery bookkeeping. This separation prevents an NVIDIA outage from
+    changing when the simulated person decided to reply or from exposing later
+    conversation context to a retry.
     """
 
     def __init__(self, path: str | Path) -> None:
@@ -67,7 +77,8 @@ class SQLiteSimulationStore:
                     created_at TEXT NOT NULL,
                     status TEXT NOT NULL DEFAULT 'PENDING',
                     generation_attempts INTEGER NOT NULL DEFAULT 0,
-                    last_error TEXT
+                    last_error TEXT,
+                    next_attempt_at TEXT
                 );
                 CREATE INDEX IF NOT EXISTS idx_scheduled_due
                     ON scheduled_events(status, due_at);
@@ -86,7 +97,6 @@ class SQLiteSimulationStore:
                     ON simulation_messages(twin_person_id, platform, conversation_id, timestamp);
                 """
             )
-            # v1.1 migration for databases created by <=1.0.5.
             columns = {
                 row["name"]
                 for row in db.execute("PRAGMA table_info(scheduled_events)").fetchall()
@@ -98,6 +108,8 @@ class SQLiteSimulationStore:
                 )
             if "last_error" not in columns:
                 db.execute("ALTER TABLE scheduled_events ADD COLUMN last_error TEXT")
+            if "next_attempt_at" not in columns:
+                db.execute("ALTER TABLE scheduled_events ADD COLUMN next_attempt_at TEXT")
 
     def set_last_processed(self, timestamp: datetime) -> None:
         with self._connect() as db:
@@ -146,8 +158,8 @@ class SQLiteSimulationStore:
             db.execute(
                 "INSERT INTO scheduled_events("
                 "event_id,twin_person_id,platform,conversation_id,action,due_at,created_at,"
-                "status,generation_attempts,last_error"
-                ") VALUES(?,?,?,?,?,?,?,'PENDING',0,NULL)",
+                "status,generation_attempts,last_error,next_attempt_at"
+                ") VALUES(?,?,?,?,?,?,?,'PENDING',0,NULL,NULL)",
                 (
                     event_id,
                     twin_person_id,
@@ -201,8 +213,9 @@ class SQLiteSimulationStore:
         with self._connect() as db:
             rows = db.execute(
                 "SELECT * FROM scheduled_events "
-                f"WHERE status IN ({placeholders}) AND due_at<=? "
-                "ORDER BY due_at,event_id",
+                f"WHERE status IN ({placeholders}) "
+                "AND COALESCE(next_attempt_at,due_at)<=? "
+                "ORDER BY COALESCE(next_attempt_at,due_at),event_id",
                 (*_DUE_STATUSES, now.isoformat()),
             ).fetchall()
         return [self._scheduled_from_row(row) for row in rows]
@@ -212,7 +225,8 @@ class SQLiteSimulationStore:
         with self._connect() as db:
             rows = db.execute(
                 "SELECT * FROM scheduled_events "
-                f"WHERE status IN ({placeholders}) ORDER BY due_at,event_id",
+                f"WHERE status IN ({placeholders}) "
+                "ORDER BY COALESCE(next_attempt_at,due_at),event_id",
                 _ACTIVE_STATUSES,
             ).fetchall()
         return [self._scheduled_from_row(row) for row in rows]
@@ -226,7 +240,7 @@ class SQLiteSimulationStore:
     ) -> ScheduledEvent:
         with self._connect() as db:
             cursor = db.execute(
-                "UPDATE scheduled_events SET status='RETRY', due_at=?, "
+                "UPDATE scheduled_events SET status='RETRY', next_attempt_at=?, "
                 "generation_attempts=generation_attempts+1, last_error=? "
                 "WHERE event_id=? AND status IN ('PENDING','RETRY')",
                 (retry_at.isoformat(), error[:500], event_id),
@@ -241,7 +255,7 @@ class SQLiteSimulationStore:
     def block_event(self, event_id: str, *, error: str) -> ScheduledEvent:
         with self._connect() as db:
             cursor = db.execute(
-                "UPDATE scheduled_events SET status='BLOCKED', "
+                "UPDATE scheduled_events SET status='BLOCKED', next_attempt_at=NULL, "
                 "generation_attempts=generation_attempts+1, last_error=? "
                 "WHERE event_id=? AND status IN ('PENDING','RETRY')",
                 (error[:500], event_id),
@@ -261,7 +275,7 @@ class SQLiteSimulationStore:
     ) -> ScheduledEvent:
         with self._connect() as db:
             cursor = db.execute(
-                "UPDATE scheduled_events SET status='RETRY', due_at=?, last_error=NULL "
+                "UPDATE scheduled_events SET status='RETRY', next_attempt_at=?, last_error=NULL "
                 "WHERE event_id=? AND status='BLOCKED'",
                 (retry_at.isoformat(), event_id),
             )
@@ -275,8 +289,8 @@ class SQLiteSimulationStore:
     def mark_processed(self, event_id: str) -> None:
         with self._connect() as db:
             cursor = db.execute(
-                "UPDATE scheduled_events SET status='PROCESSED', last_error=NULL "
-                "WHERE event_id=? AND status IN ('PENDING','RETRY')",
+                "UPDATE scheduled_events SET status='PROCESSED', last_error=NULL, "
+                "next_attempt_at=NULL WHERE event_id=? AND status IN ('PENDING','RETRY')",
                 (event_id,),
             )
             if cursor.rowcount != 1:
@@ -364,6 +378,7 @@ class SQLiteSimulationStore:
 
     @staticmethod
     def _scheduled_from_row(row: sqlite3.Row) -> ScheduledEvent:
+        keys = set(row.keys())
         return ScheduledEvent(
             event_id=row["event_id"],
             twin_person_id=row["twin_person_id"],
@@ -375,4 +390,9 @@ class SQLiteSimulationStore:
             status=row["status"],
             generation_attempts=int(row["generation_attempts"] or 0),
             last_error=row["last_error"],
+            next_attempt_at=(
+                datetime.fromisoformat(row["next_attempt_at"])
+                if "next_attempt_at" in keys and row["next_attempt_at"]
+                else None
+            ),
         )

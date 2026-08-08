@@ -1,4 +1,4 @@
-# Really-unREAL GUI Quick Start
+# Really-unREAL 1.1 GUI Quick Start
 
 The desktop UI provides a simple first-run path without editing `identity.local.json` or typing long CLI commands.
 
@@ -19,26 +19,27 @@ On Windows, use **Ctrl** to pick individual files or **Shift** to select a range
 
 After loading, confirm the suggested **내 이름** and choose **대화 상대**.
 
-## 2. 빠른 진단 — no LLM
+## 2. 빠른 진단 — LLM 없음
 
 **빠른 진단 (LLM 없음)** does not generate a reply. It checks that the selected data can build the replay dataset and reply-timing model.
 
-Use it when you want to answer questions such as:
-
-- Did the Kakao exports parse correctly?
-- Is my display name / target mapping usable?
-- Is there enough history for replay and timing analysis?
-- Can the relationship-specific timing model be built?
-
-No model API is called in this mode.
+Use it to check whether the exports parsed correctly, the self/target mapping is usable, enough history exists, and a relationship-specific timing model can be built. No model API is called.
 
 ## 3. 모델 테스트 — Historical Replay benchmark
 
 **모델 테스트 · Local LLM** and **모델 테스트 · NVIDIA NIM** are evaluation modes, not chat modes.
 
-Really-unREAL hides real historical continuations, asks the model to reproduce them using only older evidence, and then compares the generated burst with the held-out real continuation. The result panel shows a human-readable summary such as generation success count, elapsed time, writing-form similarity, message-splitting error, expression matches, and timing-range matches.
+Really-unREAL hides real historical continuations, asks the model to reproduce them using only older evidence, and then evaluates separate observable dimensions:
 
-Use **결과 저장** when you want the full numeric JSON.
+- character-pattern and token overlap;
+- ending/style overlap;
+- message-burst splitting;
+- laughter/cry/question behavior;
+- reply timing falling inside the feasible historical interval.
+
+When enough cases exist the GUI shows descriptive 95% intervals. A point estimate from a tiny sample must not be treated as an overall fidelity score.
+
+**NVIDIA defaults to 3 cases only as a quick smoke check.** For actual model comparison, raise **테스트 수** to at least 10–20 when time/API budget allows. Use **결과 저장** for the full numeric JSON.
 
 ### Local model
 
@@ -64,18 +65,28 @@ Hosted inference sends cutoff-safe private conversation context to NVIDIA. Paste
 
 Select **Local LLM** or **NVIDIA NIM**, then press **대화 시작**.
 
-A separate messenger-like window opens for the selected person. Messages typed there are simulation input only; they are not sent to a real service.
+A separate messenger-like window opens for the selected person. Messages typed there are simulation input only; they are not sent to a real messaging service.
 
-The live mode is intentionally not an instant chatbot:
+### What happens after you send a message
 
-1. You type a message.
-2. Really-unREAL records it as `SIMULATION`.
-3. The learned relationship timing model schedules a `REPLY` time.
-4. The chat window shows a countdown such as `답장 예정 · 약 28초 후`.
-5. Only when the scheduled time arrives does the language model generate the reply.
-6. After a reply, an optional future `INITIATE` event may be scheduled from historical behavior.
+1. Your input is recorded as `SIMULATION`.
+2. The live behavior model looks at observable context: relationship, clock time, weekday/weekend, recent activity, previous gap, and—when enough evidence exists—whether the current message is a question, very short message, or statement.
+3. A stochastic `REPLY` time is scheduled from historical behavior; it is not a fixed 30-second timer.
+4. The chat window displays the countdown.
+5. Only when the behavior time arrives is the language model called.
+6. Generation uses the current visible conversation, relationship-focused style/burst profiles, cutoff-safe memory/retrieval, and at most two older REAL replies as private style exemplars.
+7. A guard retries generation if a long output is suspiciously close to one of those historical exemplars.
+8. After a reply, an optional `INITIATE` event may be scheduled from historical behavior.
 
-Pending events and simulated messages are persisted in a local SQLite database, so closing and reopening the app does not deliberately collapse elapsed time. **새 대화** clears only SIMULATION state; imported real evidence is never deleted by that button.
+### What if NVIDIA/local inference fails?
+
+Provider availability does **not** decide whether the simulated person wanted to reply.
+
+- Temporary HTTP 429/5xx, timeout or network failure: the original reply behavior time is preserved; generation delivery retries separately with backoff.
+- Configuration/credential/invalid-format failure: the action is kept as blocked instead of silently deleted. Fix the provider setting and choose **생성 재시도**.
+- A retry never gets to read real/simulated messages that arrived after the original behavior time merely because the provider was down.
+
+Pending events and simulated messages are persisted in a local SQLite database. **새 대화** clears only SIMULATION state; imported REAL evidence is never deleted by that button.
 
 ## Privacy boundaries
 
@@ -85,7 +96,12 @@ Pending events and simulated messages are persisted in a local SQLite database, 
 - simulation output is never promoted into asserted real history;
 - hosted/private-context routes require explicit consent;
 - no real messaging-platform sending API is called;
-- historical raw message text is not printed in benchmark results by default.
+- historical raw message text is not printed in benchmark results;
+- live style exemplars are prompt-time private context only and are not written to public result JSON or release artifacts.
+
+## Important interpretation limit
+
+Really-unREAL 1.1 uses a general language model conditioned by person-specific observable evidence. It does **not** claim that the base LLM itself has been neurally fine-tuned into that person, nor that replay similarity reconstructs hidden identity or mental state.
 
 ## Advanced CLI
 

@@ -1,0 +1,85 @@
+name: Release v1.1.0-rc.1
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/release-v1.1.0-rc.1.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  statuses: write
+
+jobs:
+  release-windows:
+    runs-on: windows-latest
+    timeout-minutes: 25
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install test and build dependencies
+        id: install
+        continue-on-error: true
+        run: python -m pip install -e ".[dev,build]"
+      - name: Verify release-candidate version
+        id: version
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $version = python -c "import backend; print(backend.__version__)"
+          if ($version.Trim() -ne "1.1.0rc1") { throw "Expected 1.1.0rc1, got $version" }
+      - name: Run tests
+        id: tests
+        continue-on-error: true
+        run: pytest -q
+      - name: Import integrated runtime
+        id: import_gui
+        continue-on-error: true
+        run: python -c "import backend.live_timing; import backend.generation_guard; import backend.persona.style_fingerprint; import backend.providers.errors; import backend.gui_live; import backend.gui_chat_window; import backend.gui_responsive; import backend.gui_entry; print('rc.1 import OK')"
+      - name: Build Windows executable
+        id: build
+        continue-on-error: true
+        run: pyinstaller --noconfirm --clean --onefile --windowed --name Really-unREAL backend/gui_entry.py
+      - name: Smoke test packaged executable
+        id: smoke
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          & .\dist\Really-unREAL.exe --smoke
+          exit $LASTEXITCODE
+      - name: Package portable ZIP
+        id: package
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force package | Out-Null
+          Copy-Item dist/Really-unREAL.exe package/Really-unREAL.exe
+          Copy-Item docs/QUICKSTART_GUI.md package/QUICKSTART.md
+          Compress-Archive -Path package/* -DestinationPath Really-unREAL-v1.1.0-rc.1-Windows-x64.zip -Force
+      - name: Create prerelease
+        id: release
+        if: steps.install.outcome == 'success' && steps.version.outcome == 'success' && steps.tests.outcome == 'success' && steps.import_gui.outcome == 'success' && steps.build.outcome == 'success' && steps.smoke.outcome == 'success' && steps.package.outcome == 'success'
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          if (gh release view v1.1.0-rc.1 *> $null) {
+            gh release upload v1.1.0-rc.1 Really-unREAL-v1.1.0-rc.1-Windows-x64.zip --clobber
+          } else {
+            gh release create v1.1.0-rc.1 Really-unREAL-v1.1.0-rc.1-Windows-x64.zip --target "$env:GITHUB_SHA" --title "Really-unREAL v1.1.0-rc.1" --notes-file RELEASE_NOTES_v1.1.0-rc.1.md --prerelease
+          }
+      - name: Publish release status
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const outcomes = ['${{ steps.install.outcome }}','${{ steps.version.outcome }}','${{ steps.tests.outcome }}','${{ steps.import_gui.outcome }}','${{ steps.build.outcome }}','${{ steps.smoke.outcome }}','${{ steps.package.outcome }}','${{ steps.release.outcome }}'];
+            const ok = outcomes.every(v => v === 'success');
+            await github.rest.repos.createCommitStatus({owner: context.repo.owner, repo: context.repo.repo, sha: context.sha, state: ok ? 'success' : 'failure', context: 'release-v1.1.0-rc.1', description: ok ? 'v1.1.0 rc.1 Windows prerelease published' : 'rc.1 release validation failed'});
+      - name: Fail when validation failed
+        if: always() && (steps.install.outcome != 'success' || steps.version.outcome != 'success' || steps.tests.outcome != 'success' || steps.import_gui.outcome != 'success' || steps.build.outcome != 'success' || steps.smoke.outcome != 'success' || steps.package.outcome != 'success' || steps.release.outcome != 'success')
+        run: exit 1

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import statistics
 import time
 from collections.abc import Callable
@@ -39,6 +40,33 @@ def _mean(values: list[float]) -> float | None:
     return round(statistics.fmean(values), 6) if values else None
 
 
+def _mean_ci95(values: list[float], *, bounded: bool = True) -> dict[str, float] | None:
+    """Small-sample descriptive CI; reported to prevent point-estimate overclaiming."""
+
+    if len(values) < 2:
+        return None
+    mean = statistics.fmean(values)
+    standard_error = statistics.stdev(values) / math.sqrt(len(values))
+    margin = 1.96 * standard_error
+    lower = mean - margin
+    upper = mean + margin
+    if bounded:
+        lower = max(0.0, lower)
+        upper = min(1.0, upper)
+    return {
+        "lower": round(lower, 6),
+        "upper": round(upper, 6),
+    }
+
+
+def _sample_note(generated_cases: int) -> str:
+    if generated_cases < 10:
+        return "표본이 작아 빠른 smoke 확인용입니다. 모델 비교에는 10~20개 이상을 권장합니다."
+    if generated_cases < 20:
+        return "기초 비교가 가능한 표본입니다. 더 안정적인 비교에는 20개 이상을 권장합니다."
+    return "비교용 표본 수를 확보했습니다. 그래도 사람별 데이터 양과 테스트 구간을 함께 확인하세요."
+
+
 def run_generation_replay_interactive(
     *,
     evidence,
@@ -48,12 +76,7 @@ def run_generation_replay_interactive(
     progress: ProgressCallback | None = None,
     is_cancelled: CancelCheck | None = None,
 ) -> dict[str, object]:
-    """Run replay generation with GUI progress, cancellation and per-case isolation.
-
-    Cancellation is cooperative. If a network request is already in flight the
-    runner stops immediately after that request returns or reaches its provider
-    timeout. A single provider/format failure no longer discards earlier cases.
-    """
+    """Run replay generation with progress, cancellation and uncertainty reporting."""
 
     started = time.monotonic()
     _, _, split = fixed_kakao_split(evidence, self_person_id=self_person_id)
@@ -77,6 +100,7 @@ def run_generation_replay_interactive(
     laugh_matches: list[float] = []
     cry_matches: list[float] = []
     question_matches: list[float] = []
+    timing_matches: list[float] = []
     temporal_early_predictions = 0
     temporal_late_predictions = 0
     failed_cases = 0
@@ -91,17 +115,25 @@ def run_generation_replay_interactive(
             break
 
         if progress:
-            progress(index_number - 1, total, failed_cases, f"Case {index_number}/{total} · 모델 응답 대기 중")
+            progress(
+                index_number - 1,
+                total,
+                failed_cases,
+                f"Case {index_number}/{total} · 모델 응답 대기 중",
+            )
 
         predicted_delay = (
             hazard.predict_median_delay_seconds(case)
             if selection.selected_model == "hazard"
             else baseline.predict_delay_seconds(case)
         )
+        timing_inside = True
         if predicted_delay < case.delay_lower_seconds:
             temporal_early_predictions += 1
+            timing_inside = False
         elif predicted_delay > case.delay_upper_seconds:
             temporal_late_predictions += 1
+            timing_inside = False
 
         chosen_action = _candidate_action(case)
         packet = build_generation_context(
@@ -119,9 +151,15 @@ def run_generation_replay_interactive(
         except (RuntimeError, ValueError, TimeoutError):
             failed_cases += 1
             if progress:
-                progress(index_number, total, failed_cases, f"Case {index_number}/{total} 실패 · 다음 케이스 진행")
+                progress(
+                    index_number,
+                    total,
+                    failed_cases,
+                    f"Case {index_number}/{total} 실패 · 다음 케이스 진행",
+                )
             continue
 
+        timing_matches.append(float(timing_inside))
         burst_errors.append(float(metrics.burst_size_absolute_error))
         length_errors.append(float(metrics.total_char_length_absolute_error))
         bigram_scores.append(metrics.char_bigram_f1)
@@ -151,14 +189,20 @@ def run_generation_replay_interactive(
         "ambiguous_test_cases": sum(case.action_is_ambiguous for case in requested),
         "temporal_early_predictions": temporal_early_predictions,
         "temporal_late_predictions": temporal_late_predictions,
+        "timing_inside_rate": _mean(timing_matches),
+        "timing_inside_rate_ci95": _mean_ci95(timing_matches),
         "mean_burst_size_absolute_error": _mean(burst_errors),
         "mean_total_char_length_absolute_error": _mean(length_errors),
         "mean_char_bigram_f1": _mean(bigram_scores),
+        "mean_char_bigram_f1_ci95": _mean_ci95(bigram_scores),
         "mean_token_f1": _mean(token_scores),
+        "mean_token_f1_ci95": _mean_ci95(token_scores),
         "mean_ending_f1": _mean(ending_scores),
+        "mean_ending_f1_ci95": _mean_ci95(ending_scores),
         "laugh_presence_match_rate": _mean(laugh_matches),
         "cry_presence_match_rate": _mean(cry_matches),
         "question_presence_match_rate": _mean(question_matches),
+        "evaluation_sample_note": _sample_note(generated_cases),
         "retrieval_backend": "lexical",
     }
 
