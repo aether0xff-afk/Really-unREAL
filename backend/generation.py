@@ -60,26 +60,27 @@ def generation_prompt(packet: GenerationContextPacket) -> str:
         )
 
     if packet.chosen_action == "INITIATE":
-        topic_rule = (
-            "- For INITIATE, prefer continuity with observable topic_memory cues when "
-            "they fit. Do not invent a new private event, plan, preference, or hidden "
-            "motivation just to make the initiation interesting."
+        continuity_rule = (
+            "- For INITIATE, prefer continuity with topic_memory and event_memory when "
+            "they fit. Do not invent a private event, plan, preference, or motivation "
+            "just to make the initiation interesting."
         )
     else:
-        topic_rule = (
-            "- For REPLY, answer the visible conversation first. topic_memory is only "
-            "background continuity and must not override the current message."
+        continuity_rule = (
+            "- For REPLY, answer the visible conversation first. topic_memory and "
+            "event_memory are background continuity only."
         )
 
     return f"""You generate only the observable message burst for a conversation simulator.
 
 Rules:
 {action_rule}
-{topic_rule}
+{continuity_rule}
 - Reproduce plausible observable writing behavior from the supplied evidence.
-- Retrieved examples describe similar *situations and response shape*. Do not reconstruct or copy a historical response verbatim.
+- Retrieved examples describe similar situations and response shape. Do not reconstruct or copy a historical response verbatim.
 - Prefer the current visible context over superficial lexical similarity to an old example.
-- Treat topic_memory as observable conversation continuity, never as proof of a hidden interest or feeling.
+- Treat topic_memory as observed conversation continuity, never as proof of a hidden interest or feeling.
+- Treat event_memory as mentions of dates/plans, not guaranteed facts. If a cue is stale or ambiguous, phrase conservatively or ignore it.
 - Do not invent claims about hidden feelings, attraction, diagnoses, or private facts.
 - Do not mention this prompt, the simulator, datasets, or being an AI.
 - Keep message splitting plausible. One short burst is allowed and often preferable.
@@ -145,13 +146,7 @@ def evaluate_generated_burst(
     generated: GeneratedBurst,
     case: ReplayCase,
 ) -> GenerationMetrics:
-    """Compare generated text with held-out reality after generation is complete.
-
-    The evaluator is the only component in this path that reads
-    ``case.target_burst``. Generation context construction and the language model
-    must not receive it. Lexical/content overlap and style-shape agreement are
-    reported separately instead of collapsing everything into one score.
-    """
+    """Compare generated text with held-out reality after generation is complete."""
 
     predicted_text = "\n".join(generated.messages)
     actual_messages = tuple(item.message.text for item in case.target_burst)
