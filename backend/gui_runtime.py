@@ -35,27 +35,81 @@ NVIDIA_GUI_TIMEOUT_SECONDS = 45.0
 NVIDIA_GUI_MAX_ATTEMPTS = 1
 NVIDIA_GUI_FORMAT_ATTEMPTS = 1
 
+_T_CRITICAL_975 = {
+    1: 12.706,
+    2: 4.303,
+    3: 3.182,
+    4: 2.776,
+    5: 2.571,
+    6: 2.447,
+    7: 2.365,
+    8: 2.306,
+    9: 2.262,
+    10: 2.228,
+    11: 2.201,
+    12: 2.179,
+    13: 2.160,
+    14: 2.145,
+    15: 2.131,
+    16: 2.120,
+    17: 2.110,
+    18: 2.101,
+    19: 2.093,
+    20: 2.086,
+    21: 2.080,
+    22: 2.074,
+    23: 2.069,
+    24: 2.064,
+    25: 2.060,
+    26: 2.056,
+    27: 2.052,
+    28: 2.048,
+    29: 2.045,
+    30: 2.042,
+}
+
 
 def _mean(values: list[float]) -> float | None:
     return round(statistics.fmean(values), 6) if values else None
 
 
 def _mean_ci95(values: list[float], *, bounded: bool = True) -> dict[str, float] | None:
-    """Small-sample descriptive CI; reported to prevent point-estimate overclaiming."""
+    """Student-t interval for a mean; tiny samples no longer use z=1.96."""
 
     if len(values) < 2:
         return None
     mean = statistics.fmean(values)
     standard_error = statistics.stdev(values) / math.sqrt(len(values))
-    margin = 1.96 * standard_error
+    df = len(values) - 1
+    critical = _T_CRITICAL_975.get(df, 1.96)
+    margin = critical * standard_error
     lower = mean - margin
     upper = mean + margin
     if bounded:
         lower = max(0.0, lower)
         upper = min(1.0, upper)
+    return {"lower": round(lower, 6), "upper": round(upper, 6)}
+
+
+def _wilson_ci95(values: list[float]) -> dict[str, float] | None:
+    """Wilson score interval for binary match rates."""
+
+    if not values:
+        return None
+    n = len(values)
+    successes = sum(1 for value in values if value >= 0.5)
+    p = successes / n
+    z = 1.96
+    denominator = 1.0 + (z * z) / n
+    center = (p + (z * z) / (2 * n)) / denominator
+    margin = (
+        z
+        * math.sqrt((p * (1 - p) / n) + (z * z) / (4 * n * n))
+        / denominator
+    )
     return {
-        "lower": round(lower, 6),
-        "upper": round(upper, 6),
+        "lower": round(max(0.0, center - margin), 6),
+        "upper": round(min(1.0, center + margin), 6),
     }
 
 
@@ -76,7 +130,7 @@ def run_generation_replay_interactive(
     progress: ProgressCallback | None = None,
     is_cancelled: CancelCheck | None = None,
 ) -> dict[str, object]:
-    """Run replay generation with progress, cancellation and uncertainty reporting."""
+    """Run replay generation while keeping timing independent of provider health."""
 
     started = time.monotonic()
     _, _, split = fixed_kakao_split(evidence, self_person_id=self_person_id)
@@ -134,6 +188,9 @@ def run_generation_replay_interactive(
         elif predicted_delay > case.delay_upper_seconds:
             temporal_late_predictions += 1
             timing_inside = False
+        # Timing is a behavior-model metric. Record it even if the provider later
+        # fails to generate content for this case.
+        timing_matches.append(float(timing_inside))
 
         chosen_action = _candidate_action(case)
         packet = build_generation_context(
@@ -159,7 +216,6 @@ def run_generation_replay_interactive(
                 )
             continue
 
-        timing_matches.append(float(timing_inside))
         burst_errors.append(float(metrics.burst_size_absolute_error))
         length_errors.append(float(metrics.total_char_length_absolute_error))
         bigram_scores.append(metrics.char_bigram_f1)
@@ -189,8 +245,9 @@ def run_generation_replay_interactive(
         "ambiguous_test_cases": sum(case.action_is_ambiguous for case in requested),
         "temporal_early_predictions": temporal_early_predictions,
         "temporal_late_predictions": temporal_late_predictions,
+        "timing_evaluated_cases": len(timing_matches),
         "timing_inside_rate": _mean(timing_matches),
-        "timing_inside_rate_ci95": _mean_ci95(timing_matches),
+        "timing_inside_rate_ci95": _wilson_ci95(timing_matches),
         "mean_burst_size_absolute_error": _mean(burst_errors),
         "mean_total_char_length_absolute_error": _mean(length_errors),
         "mean_char_bigram_f1": _mean(bigram_scores),
@@ -200,8 +257,11 @@ def run_generation_replay_interactive(
         "mean_ending_f1": _mean(ending_scores),
         "mean_ending_f1_ci95": _mean_ci95(ending_scores),
         "laugh_presence_match_rate": _mean(laugh_matches),
+        "laugh_presence_match_rate_ci95": _wilson_ci95(laugh_matches),
         "cry_presence_match_rate": _mean(cry_matches),
+        "cry_presence_match_rate_ci95": _wilson_ci95(cry_matches),
         "question_presence_match_rate": _mean(question_matches),
+        "question_presence_match_rate_ci95": _wilson_ci95(question_matches),
         "evaluation_sample_note": _sample_note(generated_cases),
         "retrieval_backend": "lexical",
     }
