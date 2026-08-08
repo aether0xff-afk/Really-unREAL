@@ -109,7 +109,9 @@ jobs:
         run: |
           gh release view v1.1.0 *> $null
           if ($LASTEXITCODE -eq 0) {
-            Write-Host "v1.1.0 release already exists; replacing Windows asset"
+            Write-Host "v1.1.0 release already exists; synchronizing notes and Windows asset"
+            gh release edit v1.1.0 --title "Really-unREAL v1.1.0" --notes-file RELEASE_NOTES_v1.1.0.md
+            if ($LASTEXITCODE -ne 0) { throw "GitHub Release notes update failed" }
             gh release upload v1.1.0 Really-unREAL-v1.1.0-Windows-x64.zip --clobber
           } else {
             Write-Host "Creating v1.1.0 release"
