@@ -17,6 +17,10 @@ from backend.replay_baseline import (
     EmpiricalTimingBaseline,
     evaluate_empirical_baseline,
 )
+from backend.replay_hazard import (
+    evaluate_hazard_model,
+    select_temporal_model,
+)
 
 
 def main() -> None:
@@ -70,20 +74,68 @@ def main() -> None:
     split = chronological_split(cases) if cases else None
 
     baseline_output: dict[str, object] | None = None
+    temporal_selection_output: dict[str, object] | None = None
+
     if split is not None and split.train and split.test:
         baseline = EmpiricalTimingBaseline.fit(
             split.train,
             quantile=args.baseline_quantile,
         )
         test_snapshots = build_action_snapshots(split.test)
+        baseline_test_metrics = evaluate_empirical_baseline(
+            baseline,
+            split.test,
+            test_snapshots,
+        )
         baseline_output = {
             "thresholds": baseline.thresholds_dict(),
-            "test_metrics": evaluate_empirical_baseline(
-                baseline,
+            "test_metrics": baseline_test_metrics.to_dict(),
+        }
+
+        if split.validation:
+            (
+                selection,
+                selected_baseline,
+                hazard,
+                baseline_validation_metrics,
+                hazard_validation_metrics,
+            ) = select_temporal_model(split.train, split.validation)
+
+            # The selector uses the canonical median empirical baseline. Keep its
+            # test comparison next to the hazard result so model selection stays
+            # validation-only and the final test set is never used to choose.
+            selected_baseline_test = evaluate_empirical_baseline(
+                selected_baseline,
                 split.test,
                 test_snapshots,
-            ).to_dict(),
-        }
+            )
+            hazard_test = evaluate_hazard_model(
+                hazard,
+                split.test,
+                test_snapshots,
+            )
+            selected_test_metrics = (
+                hazard_test.to_dict()
+                if selection.selected_model == "hazard"
+                else selected_baseline_test.to_dict()
+            )
+            temporal_selection_output = {
+                "selection": selection.to_dict(),
+                "hazard": {
+                    "summary": hazard.summary_dict(),
+                    "validation_metrics": hazard_validation_metrics.to_dict(),
+                    "test_metrics": hazard_test.to_dict(),
+                },
+                "canonical_empirical": {
+                    "validation_metrics": baseline_validation_metrics.to_dict(),
+                    "test_metrics": selected_baseline_test.to_dict(),
+                },
+                "selected_test_metrics": selected_test_metrics,
+                "selection_contract": (
+                    "Only train+validation choose the model. Test is reported after "
+                    "selection and never participates in the choice."
+                ),
+            }
 
     output: dict[str, object] = {
         "person_id": args.person_id,
@@ -99,6 +151,7 @@ def main() -> None:
             else {"train": 0, "validation": 0, "test": 0}
         ),
         "empirical_timing_baseline": baseline_output,
+        "temporal_model_selection": temporal_selection_output,
         "privacy": (
             "This audit reports counts/timing only. Hidden real message text is not "
             "printed by default."
