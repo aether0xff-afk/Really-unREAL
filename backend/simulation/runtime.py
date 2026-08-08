@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from typing import Protocol
 
 from backend.fusion import EvidenceMessage, PersonEvidence
 from backend.generation import BurstLanguageModel, GeneratedBurst
@@ -11,6 +12,16 @@ from backend.replay_baseline import EmpiricalTimingBaseline
 from backend.retrieval import CutoffExampleIndex
 from backend.simulation.action_policy import Action
 from backend.simulation.store import SQLiteSimulationStore, ScheduledEvent
+
+
+class TimingSampler(Protocol):
+    def sample_delay_seconds(
+        self,
+        *,
+        platform: str,
+        conversation_id: str,
+        action: Action,
+    ) -> float | None: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -86,6 +97,11 @@ class LiveSimulationEngine:
     future action times. Text generation occurs at dispatch time, so WAIT remains
     a real outcome and closing/reopening the app does not collapse elapsed time.
 
+    The deterministic timing baseline remains available as a fallback and for
+    evaluation. Live desktop sessions may additionally provide a ``TimingSampler``
+    so each future event is drawn from historically observed timing variability
+    instead of reusing one median delay forever.
+
     The runtime never sends to a real platform. ``process_due`` returns simulated
     emissions to the caller/UI and stores them as SIMULATION memory only.
     """
@@ -101,6 +117,7 @@ class LiveSimulationEngine:
         timing: EmpiricalTimingBaseline,
         language_model: BurstLanguageModel,
         store: SQLiteSimulationStore,
+        timing_sampler: TimingSampler | None = None,
     ) -> None:
         if evidence.person_id != twin_person_id:
             raise ValueError("evidence and twin_person_id must match")
@@ -110,8 +127,25 @@ class LiveSimulationEngine:
         self.evidence = evidence
         self.retrieval_index = retrieval_index
         self.timing = timing
+        self.timing_sampler = timing_sampler
         self.language_model = language_model
         self.store = store
+
+    def _next_delay(self, action: Action) -> float | None:
+        if self.timing_sampler is not None:
+            sampled = self.timing_sampler.sample_delay_seconds(
+                platform=self.platform,
+                conversation_id=self.conversation_id,
+                action=action,
+            )
+            if sampled is not None:
+                return max(0.0, float(sampled))
+        return _delay_for(
+            self.timing,
+            platform=self.platform,
+            conversation_id=self.conversation_id,
+            action=action,
+        )
 
     def observe_counterpart_message(self, *, observed_at: datetime) -> ScheduledEvent:
         self.store.cancel_pending(
@@ -120,12 +154,7 @@ class LiveSimulationEngine:
             conversation_id=self.conversation_id,
             action=Action.INITIATE,
         )
-        delay = _delay_for(
-            self.timing,
-            platform=self.platform,
-            conversation_id=self.conversation_id,
-            action=Action.REPLY,
-        )
+        delay = self._next_delay(Action.REPLY)
         if delay is None:
             raise RuntimeError("reply timing is unavailable")
         return self.store.schedule(
@@ -138,12 +167,7 @@ class LiveSimulationEngine:
         )
 
     def schedule_idle_initiation(self, *, after: datetime) -> ScheduledEvent | None:
-        delay = _delay_for(
-            self.timing,
-            platform=self.platform,
-            conversation_id=self.conversation_id,
-            action=Action.INITIATE,
-        )
+        delay = self._next_delay(Action.INITIATE)
         if delay is None:
             return None
         return self.store.schedule(
