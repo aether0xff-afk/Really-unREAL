@@ -21,6 +21,7 @@ def _case(
     previous_person_id: str,
     delay_seconds: float,
     weight: float,
+    conversation_id: str = "c",
 ) -> ReplayCase:
     context_kind = (
         EvidenceContext.KAKAO_DIRECT
@@ -30,7 +31,7 @@ def _case(
     previous = EvidenceMessage(
         message=ChatMessage(BASE, "previous", "x"),
         platform=platform,
-        conversation_id="c",
+        conversation_id=conversation_id,
         context=context_kind,
         sender_person_id=previous_person_id,
         evidence_weight=weight,
@@ -38,7 +39,7 @@ def _case(
     target = EvidenceMessage(
         message=ChatMessage(BASE + timedelta(seconds=delay_seconds), "target", "y"),
         platform=platform,
-        conversation_id="c",
+        conversation_id=conversation_id,
         context=context_kind,
         sender_person_id="target",
         evidence_weight=weight,
@@ -48,7 +49,7 @@ def _case(
         case_id=case_id,
         person_id="target",
         platform=platform,
-        conversation_id="c",
+        conversation_id=conversation_id,
         evidence_context=context_kind,
         evidence_weight=weight,
         action=action,
@@ -109,6 +110,42 @@ def test_baseline_predicts_wait_until_empirical_threshold() -> None:
 
     assert baseline.predict_action(case, elapsed_seconds=60) == Action.WAIT
     assert baseline.predict_action(case, elapsed_seconds=300) == Action.REPLY
+
+
+def test_relationship_threshold_can_override_global_self_twin_timing() -> None:
+    fast = [
+        _case(
+            f"fast-{index}",
+            platform="kakao",
+            previous_person_id="friend-a",
+            delay_seconds=60,
+            weight=1.0,
+            conversation_id="friend-a",
+        )
+        for index in range(2)
+    ]
+    slow = [
+        _case(
+            f"slow-{index}",
+            platform="kakao",
+            previous_person_id="friend-b",
+            delay_seconds=3600,
+            weight=1.0,
+            conversation_id="friend-b",
+        )
+        for index in range(2)
+    ]
+    # Re-target the synthetic helper cases as SELF_TWIN output. The observable
+    # candidate action is still REPLY because the previous sender is not target.
+    train = [replace(case, person_id="self", action=Action.REPLY) for case in fast + slow]
+    baseline = EmpiricalTimingBaseline.fit(
+        train,
+        minimum_bucket_events=10,
+        minimum_conversation_events=2,
+    )
+
+    assert baseline.predict_delay_seconds(train[0]) == 60.0
+    assert baseline.predict_delay_seconds(train[-1]) == 3600.0
 
 
 def test_coarse_same_minute_delay_is_not_fitted_as_literal_zero_seconds() -> None:
