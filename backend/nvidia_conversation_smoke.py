@@ -8,6 +8,7 @@ from pathlib import Path
 from backend.generation_context import (
     GenerationContextPacket,
     RetrievedGenerationExample,
+    RetrievedResponseShape,
     VisibleGenerationMessage,
 )
 from backend.persona.cutoff import CutoffLanguageProfile
@@ -34,6 +35,25 @@ def _profile() -> CutoffLanguageProfile:
         weighted_cry_expression_ratio=0.03,
         frequent_tokens=(("ㅋㅋ", 44.0), ("아니", 21.0), ("근데", 17.0), ("ㅇㅇ", 15.0)),
         platform_message_counts={"kakao": 240},
+        weighted_question_ratio=0.12,
+        weighted_exclamation_ratio=0.01,
+        weighted_no_terminal_punctuation_ratio=0.94,
+        frequent_endings=(("ㅋㅋ", 32.0), ("ㅇㅇ", 18.0), ("아님", 9.0)),
+    )
+
+
+def _shape(
+    *lengths: int,
+    question_count: int = 0,
+    laugh_count: int = 0,
+    endings: tuple[str, ...] = (),
+) -> RetrievedResponseShape:
+    return RetrievedResponseShape(
+        message_lengths=tuple(lengths),
+        question_count=question_count,
+        laugh_expression_count=laugh_count,
+        cry_expression_count=0,
+        endings=endings,
     )
 
 
@@ -43,25 +63,25 @@ def _examples() -> tuple[RetrievedGenerationExample, ...]:
             platform="kakao",
             action="REPLY",
             context_texts=("뭐해",),
-            response_texts=("집",),
             burst_size=1,
             retrieval_score=0.91,
+            response_shape=_shape(1, endings=("집",)),
         ),
         RetrievedGenerationExample(
             platform="kakao",
             action="REPLY",
             context_texts=("과제 다함?",),
-            response_texts=("아니ㅋㅋ", "아직"),
             burst_size=2,
             retrieval_score=0.86,
+            response_shape=_shape(4, 2, laugh_count=1, endings=("ㅋㅋ", "아직")),
         ),
         RetrievedGenerationExample(
             platform="kakao",
             action="REPLY",
             context_texts=("낼 몇시에 감",),
-            response_texts=("몰라", "평소대로 갈듯"),
             burst_size=2,
             retrieval_score=0.82,
+            response_shape=_shape(2, 7, endings=("몰라", "갈듯")),
         ),
     )
 
@@ -119,6 +139,7 @@ def main() -> None:
         "provider": "nvidia-nim",
         "model": model.model,
         "synthetic_persona": True,
+        "raw_retrieved_responses": False,
         "turns": transcript,
     }
     result_path = Path(os.environ.get("RESULT_PATH", "nvidia-conversation-smoke.json"))
