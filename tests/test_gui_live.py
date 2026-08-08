@@ -32,7 +32,7 @@ class FakeModel:
     model = "fake"
 
     def generate_burst(self, packet):
-        assert packet.chosen_action.value == "REPLY"
+        assert packet.chosen_action == "REPLY"
         return GeneratedBurst(("시뮬답장",))
 
 
