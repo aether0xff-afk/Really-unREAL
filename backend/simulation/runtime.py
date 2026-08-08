@@ -169,8 +169,6 @@ class LiveSimulationEngine:
         visible_context: Sequence[EvidenceMessage] = (),
         replace_existing_reply: bool = True,
     ) -> ScheduledEvent | None:
-        # A real/simulation user message supersedes only future idle behaviors.
-        # An already CLAIMED generation is never cancelled by a later message.
         for idle_action in (Action.FOLLOW_UP, Action.INITIATE):
             self.store.cancel_pending(
                 twin_person_id=self.twin_person_id,
@@ -382,7 +380,6 @@ class LiveSimulationEngine:
                     pass
                 continue
 
-            # Causal cutoff is the modeled behavior time, never provider retry time.
             event_context = tuple(
                 item for item in visible_context if item.message.timestamp <= event.due_at
             )
@@ -427,9 +424,6 @@ class LiveSimulationEngine:
                     metadata={"action": event.action.value, "event_id": event.event_id},
                 )
             except KeyError:
-                # The user may have reset the conversation while generation was
-                # in flight. Atomic completion prevents the stale output from
-                # leaking back into the new session.
                 continue
 
             emissions.append(
@@ -445,11 +439,20 @@ class LiveSimulationEngine:
             if timestamped:
                 after = timestamped[-1][0]
                 post_context = self._post_generation_context(event_context, timestamped)
-                follow = self.schedule_idle_follow_up(
-                    after=after,
-                    visible_context=post_context,
-                )
-                if follow is None:
+                if self.continuation_policy is not None:
+                    follow = self.schedule_idle_follow_up(
+                        after=after,
+                        visible_context=post_context,
+                    )
+                    if follow is None:
+                        self.schedule_idle_initiation(
+                            after=after,
+                            visible_context=post_context,
+                        )
+                elif event.action == Action.REPLY:
+                    # Backward-compatible bare-engine behavior: one idle
+                    # initiation may follow a reply, but processing an INITIATE
+                    # must not recursively manufacture another initiation.
                     self.schedule_idle_initiation(
                         after=after,
                         visible_context=post_context,
