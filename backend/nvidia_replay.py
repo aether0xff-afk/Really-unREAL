@@ -12,6 +12,7 @@ from backend.generation_context import build_generation_context
 from backend.identity import IdentityMap
 from backend.ingest.archive import load_kakao_archive
 from backend.ingest.instagram import load_instagram_export
+from backend.privacy import require_private_context_route
 from backend.providers.embeddings import OpenAICompatibleEmbeddingProvider
 from backend.providers.nvidia import NvidiaNIMLanguageModel
 from backend.replay import ReplayCase, build_replay_cases, chronological_split
@@ -19,6 +20,9 @@ from backend.replay_hazard import select_temporal_model
 from backend.retrieval import CutoffExampleIndex, EmbeddingProvider
 from backend.simulation.action_policy import Action
 from backend.twin import TwinMode, resolve_twin_spec
+
+
+DEFAULT_NVIDIA_BASE_URL = "https://integrate.api.nvidia.com/v1"
 
 
 @dataclass(frozen=True, slots=True)
@@ -101,8 +105,6 @@ def _mean(values: list[float]) -> float | None:
 
 
 def _candidate_action(case: ReplayCase) -> Action:
-    """Infer the coarse REPLY vs INITIATE proxy from visible context."""
-
     if not case.context:
         raise ValueError("ReplayCase has no visible context")
     previous_sender = case.context[-1].sender_person_id
@@ -114,14 +116,6 @@ def _fixed_kakao_split(
     *,
     self_person_id: str,
 ):
-    """Use Kakao-only history to define one shared chronological benchmark.
-
-    Source ablations must evaluate the same future cases. Instagram may enrich
-    generation evidence, but it must not move the train/test boundary or change
-    which Kakao events are scored. This works for PERSON and SELF twins because
-    replay labels are target-relative in direct conversations.
-    """
-
     kakao_evidence = _filter_evidence(evidence, "kakao")
     cases = build_replay_cases(kakao_evidence, self_person_id=self_person_id)
     if len(cases) < 3:
@@ -140,6 +134,8 @@ def run_nvidia_replay(
     limit: int = 20,
     test_platform: str = "kakao",
     model_name: str = "nvidia/nemotron-3-ultra-550b-a55b",
+    nvidia_base_url: str = DEFAULT_NVIDIA_BASE_URL,
+    allow_remote_private_context: bool = False,
     raw_response_examples: int = 0,
     embedding_provider: EmbeddingProvider | None = None,
     embedding_weight: float = 0.70,
@@ -147,10 +143,12 @@ def run_nvidia_replay(
     if source_mode not in {"kakao", "fused"}:
         raise ValueError("source_mode must be 'kakao' or 'fused'")
 
-    _, _, split = _fixed_kakao_split(
-        evidence,
-        self_person_id=self_person_id,
+    require_private_context_route(
+        nvidia_base_url,
+        allow_remote_private_context=allow_remote_private_context,
     )
+
+    _, _, split = _fixed_kakao_split(evidence, self_person_id=self_person_id)
     selection, baseline, hazard, _, _ = select_temporal_model(
         split.train,
         split.validation,
@@ -166,10 +164,8 @@ def run_nvidia_replay(
         embedding_provider=embedding_provider,
         embedding_weight=embedding_weight,
     )
-    model = NvidiaNIMLanguageModel(model=model_name)
+    model = NvidiaNIMLanguageModel(model=model_name, base_url=nvidia_base_url)
 
-    # The scored set is always the same Kakao-only chronological test set. This
-    # makes Kakao vs fused a real source ablation instead of two different tests.
     test_cases = [case for case in split.test if case.platform == test_platform]
     requested = _evenly_limit(test_cases, limit)
 
@@ -195,9 +191,6 @@ def run_nvidia_replay(
         elif predicted_delay > case.delay_upper_seconds:
             temporal_late_predictions += 1
 
-        # Content quality is evaluated independently from timing quality. For a
-        # long-gap event, the sender-order action is only a proxy and therefore
-        # does not restrict retrieval to REPLY or INITIATE examples.
         chosen_action = _candidate_action(case)
         packet = build_generation_context(
             case,
@@ -227,7 +220,6 @@ def run_nvidia_replay(
         requested_cases=len(requested),
         generated_cases=generated_cases,
         ambiguous_test_cases=sum(case.action_is_ambiguous for case in requested),
-        # Retained as a backwards-compatible name for late timing predictions.
         temporal_wait_misses=temporal_late_predictions,
         temporal_early_predictions=temporal_early_predictions,
         temporal_late_predictions=temporal_late_predictions,
@@ -253,8 +245,6 @@ def compare_source_summaries(
     kakao: ReplayGenerationSummary,
     fused: ReplayGenerationSummary,
 ) -> dict[str, object]:
-    """Report fused-minus-Kakao deltas on the exact same held-out cases."""
-
     return {
         "mean_char_bigram_f1_delta": _delta(
             kakao.mean_char_bigram_f1,
@@ -294,16 +284,18 @@ def main() -> None:
         "--sources",
         choices=("kakao", "fused", "both"),
         default="kakao",
-        help=(
-            "Kakao is the production default; fused adds supplemental Instagram. "
-            "both runs a fair same-case ablation."
-        ),
     )
     parser.add_argument("--limit", type=int, default=20)
     parser.add_argument("--test-platform", default="kakao")
+    parser.add_argument("--model", default="nvidia/nemotron-3-ultra-550b-a55b")
+    parser.add_argument("--base-url", default=DEFAULT_NVIDIA_BASE_URL)
     parser.add_argument(
-        "--model",
-        default="nvidia/nemotron-3-ultra-550b-a55b",
+        "--allow-remote-private-context",
+        action="store_true",
+        help=(
+            "Explicitly allow private generation/retrieval context to leave this "
+            "device for configured remote endpoints"
+        ),
     )
     parser.add_argument(
         "--raw-rag-responses",
@@ -311,20 +303,9 @@ def main() -> None:
         default=0,
         help="Explicit copy-risk ablation only; production default is 0",
     )
-    parser.add_argument(
-        "--embedding-base-url",
-        help="Optional OpenAI-compatible embedding base URL; prefer a local endpoint",
-    )
-    parser.add_argument(
-        "--embedding-model",
-        help="Embedding model name required with --embedding-base-url",
-    )
-    parser.add_argument(
-        "--embedding-weight",
-        type=float,
-        default=0.70,
-        help="Dense share of retrieval similarity; lexical fallback uses the remainder",
-    )
+    parser.add_argument("--embedding-base-url")
+    parser.add_argument("--embedding-model")
+    parser.add_argument("--embedding-weight", type=float, default=0.70)
     args = parser.parse_args()
 
     identities = IdentityMap.from_json(args.identity_map)
@@ -337,10 +318,18 @@ def main() -> None:
     except (KeyError, ValueError) as exc:
         raise SystemExit(str(exc)) from exc
 
+    require_private_context_route(
+        args.base_url,
+        allow_remote_private_context=args.allow_remote_private_context,
+    )
     if bool(args.embedding_base_url) != bool(args.embedding_model):
         raise SystemExit("--embedding-base-url and --embedding-model must be supplied together")
     embedding_provider: EmbeddingProvider | None = None
     if args.embedding_base_url:
+        require_private_context_route(
+            args.embedding_base_url,
+            allow_remote_private_context=args.allow_remote_private_context,
+        )
         embedding_provider = OpenAICompatibleEmbeddingProvider(
             base_url=args.embedding_base_url,
             model=args.embedding_model,
@@ -357,11 +346,9 @@ def main() -> None:
     )
 
     privacy = (
-        "Only aggregate evaluation metrics are printed. Private prompts, generated "
-        "messages, and held-out real messages are not logged. NVIDIA generation sends "
-        "the generation packet to the configured NVIDIA endpoint. If an embedding "
-        "endpoint is configured, retrieval context is also sent to that endpoint; use "
-        "a local embedding endpoint to keep that text on-device."
+        "Raw archives remain local. Remote generation or embedding endpoints receive "
+        "only the context needed for that request and require explicit consent. "
+        "Aggregate evaluation output never prints private message text."
     )
 
     common = dict(
@@ -370,6 +357,8 @@ def main() -> None:
         limit=args.limit,
         test_platform=args.test_platform,
         model_name=args.model,
+        nvidia_base_url=args.base_url,
+        allow_remote_private_context=args.allow_remote_private_context,
         raw_response_examples=args.raw_rag_responses,
         embedding_provider=embedding_provider,
         embedding_weight=args.embedding_weight,
@@ -382,10 +371,7 @@ def main() -> None:
             "twin_mode": spec.mode.value,
             "kakao": kakao_summary.to_dict(),
             "fused": fused_summary.to_dict(),
-            "fused_minus_kakao": compare_source_summaries(
-                kakao_summary,
-                fused_summary,
-            ),
+            "fused_minus_kakao": compare_source_summaries(kakao_summary, fused_summary),
             "privacy": privacy,
         }
     else:
