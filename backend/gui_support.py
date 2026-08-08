@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 from collections import Counter
+from datetime import datetime
 from pathlib import Path
 from typing import Iterable
 
@@ -103,7 +104,7 @@ def load_quick_kakao(
 
     deduplicated.sort(
         key=lambda conversation: (
-            conversation.messages[0].timestamp if conversation.messages else Path,
+            conversation.messages[0].timestamp if conversation.messages else datetime.max,
             conversation.chat_name,
             conversation.source_archive,
         )
