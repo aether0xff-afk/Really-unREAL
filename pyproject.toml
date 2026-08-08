@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "really-unreal"
-version = "0.1.0"
-description = "Local-first real-time relationship conversation simulator grounded in message history"
+version = "1.0.0"
+description = "Local-first conversation-behavior digital-twin simulation framework"
 requires-python = ">=3.11"
 dependencies = []
 
