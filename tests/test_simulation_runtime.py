@@ -106,8 +106,6 @@ def test_live_runtime_persists_due_events_and_simulation_memory(tmp_path) -> Non
     assert stored[0].source == MemorySource.SIMULATION
     assert stored[0].text == "sim"
 
-    # Reply processing schedules one idle initiation. Reopening the same SQLite
-    # file must preserve it and recover it if it became due while closed.
     reopened = SQLiteSimulationStore(path)
     pending = reopened.pending_events()
     assert len(pending) == 1
@@ -130,3 +128,47 @@ def test_live_runtime_persists_due_events_and_simulation_memory(tmp_path) -> Non
     assert len(recovered) == 1
     assert recovered[0].action == Action.INITIATE
     assert reopened.pending_events() == []
+
+
+def test_recovery_filters_context_that_arrived_after_event_due_time(tmp_path) -> None:
+    reply_case = _case("reply", Action.REPLY, 60.0, "other")
+    timing = EmpiricalTimingBaseline.fit([reply_case])
+    incoming = _message(BASE, "other", "hello")
+    future = _message(BASE + timedelta(seconds=120), "other", "FUTURE_MESSAGE")
+    evidence = PersonEvidence(
+        "target",
+        (
+            EvidenceConversation(
+                "kakao",
+                "c",
+                EvidenceContext.KAKAO_DIRECT,
+                (incoming, future),
+            ),
+        ),
+    )
+
+    class CausalityModel:
+        def generate_burst(self, packet):
+            assert "FUTURE_MESSAGE" not in str(packet.to_dict())
+            return GeneratedBurst(("ok",))
+
+    store = SQLiteSimulationStore(tmp_path / "causal.db")
+    engine = LiveSimulationEngine(
+        twin_person_id="target",
+        platform="kakao",
+        conversation_id="c",
+        evidence=evidence,
+        retrieval_index=CutoffExampleIndex.from_replay_cases([reply_case]),
+        timing=timing,
+        language_model=CausalityModel(),
+        store=store,
+    )
+    engine.observe_counterpart_message(observed_at=BASE)
+
+    recovered = engine.recover(
+        now=BASE + timedelta(seconds=180),
+        visible_context=(incoming, future),
+    )
+
+    assert len(recovered) == 1
+    assert recovered[0].due_at == BASE + timedelta(seconds=60)
