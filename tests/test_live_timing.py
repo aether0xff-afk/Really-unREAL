@@ -1,7 +1,13 @@
+from dataclasses import replace
 from datetime import datetime, timedelta
 
 from backend.fusion import EvidenceContext, EvidenceMessage
-from backend.live_timing import ContextualLiveTimingSampler, visible_timing_features
+from backend.live_timing import (
+    BurstGapSampler,
+    ContextualLiveTimingSampler,
+    classify_message_kind,
+    visible_timing_features,
+)
 from backend.models import ChatMessage
 from backend.replay import ReplayCase
 from backend.simulation.action_policy import Action
@@ -24,10 +30,12 @@ def _case(
     delay: float,
     *,
     last_text: str = "x",
+    action: Action = Action.REPLY,
 ) -> ReplayCase:
+    previous_sender = "self" if action == Action.REPLY else "target"
     context = (
         _evidence(observation_end - timedelta(minutes=2), "target"),
-        _evidence(observation_end, "self", last_text),
+        _evidence(observation_end, previous_sender, last_text),
     )
     return ReplayCase(
         case_id=case_id,
@@ -36,7 +44,7 @@ def _case(
         conversation_id="c",
         evidence_context=EvidenceContext.KAKAO_DIRECT,
         evidence_weight=1.0,
-        action=Action.REPLY,
+        action=action,
         observation_end=observation_end,
         action_at=observation_end + timedelta(seconds=delay),
         observed_delay_seconds=delay,
@@ -45,24 +53,47 @@ def _case(
         context=context,
         target_burst=(),
         burst_size=1,
-        session_restart=False,
+        session_restart=(action == Action.INITIATE),
         action_is_ambiguous=False,
     )
 
 
-def test_visible_timing_features_capture_hour_activity_gap_and_message_kind() -> None:
+def test_visible_timing_features_capture_hour_activity_gap_since_last_and_kind() -> None:
     now = datetime(2026, 8, 8, 21, 0)
     context = (
         _evidence(now - timedelta(minutes=7), "target"),
         _evidence(now - timedelta(minutes=2), "self"),
-        _evidence(now, "self", "낼 학교 감?"),
+        _evidence(now - timedelta(seconds=20), "self", "낼 학교 감?"),
     )
     features = visible_timing_features(now, context)
     assert features.hour_band == 5
     assert features.weekend == 1
     assert features.recent_activity == "2-4"
     assert features.previous_gap == "<=5m"
+    assert features.since_last == "<=1m"
     assert features.last_message_kind == "question"
+
+
+def test_korean_question_without_question_mark_is_detected() -> None:
+    assert classify_message_kind("몇시에 감") == "question"
+    assert classify_message_kind("뭐해") == "question"
+    assert classify_message_kind("나 집가는중") == "statement"
+
+
+def test_time_since_last_visible_changes_even_when_previous_pair_gap_is_same() -> None:
+    now = datetime(2026, 8, 10, 20, 0)
+    recent = (
+        _evidence(now - timedelta(minutes=2), "target"),
+        _evidence(now - timedelta(minutes=1), "self", "뭐해"),
+    )
+    stale = (
+        _evidence(now - timedelta(days=3, minutes=1), "target"),
+        _evidence(now - timedelta(days=3), "self", "뭐해"),
+    )
+    assert visible_timing_features(now, recent).previous_gap == "<=1m"
+    assert visible_timing_features(now, stale).previous_gap == "<=5m"
+    assert visible_timing_features(now, recent).since_last == "<=1m"
+    assert visible_timing_features(now, stale).since_last == "<=7d"
 
 
 def test_contextual_sampler_changes_distribution_by_time_of_day() -> None:
@@ -107,16 +138,14 @@ def test_contextual_sampler_changes_distribution_by_time_of_day() -> None:
     ) == 300.0
 
 
-def test_contextual_sampler_can_distinguish_question_from_statement() -> None:
-    # Same relationship, time band, activity and previous gap. Only the visible
-    # current message type differs, and each cell has enough observations.
+def test_contextual_sampler_can_distinguish_question_without_punctuation() -> None:
     base_day = datetime(2026, 8, 3, 20, 0)
     cases = [
         _case(
             f"question-{i}",
             base_day + timedelta(days=i),
             12.0,
-            last_text="몇시에 감?",
+            last_text="몇시에 감",
         )
         for i in range(3)
     ] + [
@@ -138,7 +167,7 @@ def test_contextual_sampler_can_distinguish_question_from_statement() -> None:
 
     question_context = (
         _evidence(now - timedelta(minutes=2), "target"),
-        _evidence(now, "self", "오늘 몇시에 감?"),
+        _evidence(now, "self", "오늘 몇시에 감"),
     )
     statement_context = (
         _evidence(now - timedelta(minutes=2), "target"),
@@ -161,6 +190,35 @@ def test_contextual_sampler_can_distinguish_question_from_statement() -> None:
     ) == 240.0
 
 
+def test_action_validity_gate_rejects_semantically_impossible_role() -> None:
+    reply = _case("reply", datetime(2026, 8, 3, 8, 0), 42.0)
+    follow = _case(
+        "follow",
+        datetime(2026, 8, 3, 9, 0),
+        50.0,
+        action=Action.FOLLOW_UP,
+    )
+    sampler = ContextualLiveTimingSampler([reply, follow], person_id="target", seed=1)
+    now = datetime(2026, 8, 10, 12, 0)
+
+    after_user = (_evidence(now, "self", "야"),)
+    after_target = (_evidence(now, "target", "ㅇㅇ"),)
+    assert sampler.sample_delay_seconds(
+        platform="kakao",
+        conversation_id="c",
+        action=Action.FOLLOW_UP,
+        observed_at=now,
+        visible_context=after_user,
+    ) is None
+    assert sampler.sample_delay_seconds(
+        platform="kakao",
+        conversation_id="c",
+        action=Action.REPLY,
+        observed_at=now,
+        visible_context=after_target,
+    ) is None
+
+
 def test_contextual_sampler_falls_back_without_inventing_action() -> None:
     cases = [_case("reply", datetime(2026, 8, 3, 8, 0), 42.0)]
     sampler = ContextualLiveTimingSampler(cases, person_id="target", seed=1)
@@ -180,3 +238,13 @@ def test_contextual_sampler_falls_back_without_inventing_action() -> None:
         observed_at=now,
         visible_context=context,
     ) is None
+
+
+def test_burst_gap_sampler_uses_observed_internal_gaps_instead_of_fixed_one_second() -> None:
+    base = datetime(2026, 8, 3, 8, 0)
+    case = _case("burst", base, 10.0)
+    first = _evidence(base + timedelta(seconds=10), "target", "a")
+    second = _evidence(base + timedelta(seconds=17), "target", "b")
+    case = replace(case, target_burst=(first, second), burst_size=2)
+    sampler = BurstGapSampler([case], seed=1)
+    assert sampler.sample_gaps(conversation_id="c", count=2) == (7.0,)
