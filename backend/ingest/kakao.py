@@ -10,8 +10,12 @@ _DATE_SEPARATOR = re.compile(
     r"^-+\s*(?P<year>\d{4})년\s*(?P<month>\d{1,2})월\s*(?P<day>\d{1,2})일.*?-+$"
 )
 
+# A plain day header may optionally include a Korean weekday, but it must not
+# greedily consume inline message rows such as
+# ``2026년 8월 7일 오후 9:11, 나 : 뭐해``.
 _PLAIN_DATE_HEADER = re.compile(
-    r"^(?P<year>\d{4})년\s*(?P<month>\d{1,2})월\s*(?P<day>\d{1,2})일(?:\s+.+)?$"
+    r"^(?P<year>\d{4})년\s*(?P<month>\d{1,2})월\s*(?P<day>\d{1,2})일"
+    r"(?:\s+[월화수목금토일]요일)?$"
 )
 
 _BRACKET_MESSAGE = re.compile(
