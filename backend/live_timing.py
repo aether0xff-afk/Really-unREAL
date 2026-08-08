@@ -13,8 +13,26 @@ from backend.simulation.action_policy import Action, MESSAGE_ACTIONS
 
 
 _INTERROGATIVE_RE = re.compile(
-    r"(^|\s)(뭐|왜|언제|어디|누구|누가|몇|어떻게|어케|얼마|어느)(\s|$)|"
-    r"(뭐함|뭐해|뭐하|몇시|어디감|어디가|언제감|언제와|가능함|가능해|맞음|맞아)$"
+    r"(^|\s)(뭐|왜|언제|어디|누구|누가|몇|어떻게|어케|얼마|어느)(\s|$)"
+)
+_QUESTION_STEMS = (
+    "뭐함",
+    "뭐해",
+    "뭐하",
+    "몇시",
+    "몇명",
+    "몇개",
+    "어디감",
+    "어디가",
+    "언제감",
+    "언제와",
+    "어떻게",
+    "어케",
+    "얼마",
+    "가능함",
+    "가능해",
+    "맞음",
+    "맞아",
 )
 
 
@@ -31,7 +49,11 @@ class LiveTimingFeatures:
 def classify_message_kind(text: str) -> str:
     text = text.strip()
     compact = "".join(text.split())
-    if "?" in text or _INTERROGATIVE_RE.search(text):
+    if (
+        "?" in text
+        or _INTERROGATIVE_RE.search(text)
+        or any(stem in compact for stem in _QUESTION_STEMS)
+    ):
         return "question"
     if len(compact) <= 4:
         return "very_short"
@@ -324,7 +346,6 @@ class ContextualLiveTimingSampler:
 
         observed_at = observed_at or datetime.now()
 
-        # Validation-gated model first; tiny empirical cells can no longer shadow it.
         if self._hazard is not None:
             live_case = self._live_case(
                 platform=platform,
