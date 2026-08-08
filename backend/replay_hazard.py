@@ -147,13 +147,15 @@ class DiscreteHazardModel:
 
     The model estimates the probability that the target acts in the current
     elapsed-time bin given that no target action has happened yet. Features are
-    deliberately observable at prediction time: reply-vs-follow-up state,
+    deliberately observable at prediction time: reply-vs-follow-up proxy,
     platform, time of day, weekend, recent conversation activity, and the gap
     between the last two visible messages.
 
-    Sparse feature cells back off through a hierarchy and are smoothed toward
-    the global hazard for the same elapsed-time bin. No message text from the
-    held-out future is used.
+    Long-gap events whose REPLY/INITIATE role is ambiguous still inform the
+    global survival curve, but they do not update action-conditioned feature
+    cells. Sparse feature cells back off through a hierarchy and are smoothed
+    toward the global hazard for the same elapsed-time bin. No held-out message
+    text is used.
     """
 
     def __init__(
@@ -201,6 +203,11 @@ class DiscreteHazardModel:
                 feature = _feature_tuple(case, elapsed)
                 keys = _feature_keys(feature)
                 for level, key in enumerate(keys):
+                    # Level 0 is the action-agnostic global survival curve. A
+                    # long-gap event can safely inform *when* something happened,
+                    # but not whether that event was a reply or new initiation.
+                    if level > 0 and case.action_is_ambiguous:
+                        continue
                     cell = mutable_tables[level][(key, bin_index)]
                     cell[0] += weight
                     if bin_index == event_bin:
@@ -452,9 +459,13 @@ def select_temporal_model(
         validation_snapshots,
     )
 
+    confident_train_events = sum(not case.action_is_ambiguous for case in train_cases)
+    confident_validation_events = sum(
+        not case.action_is_ambiguous for case in validation_cases
+    )
     enough_data = (
-        len(train_cases) >= minimum_train_events
-        and len(validation_cases) >= minimum_validation_events
+        confident_train_events >= minimum_train_events
+        and confident_validation_events >= minimum_validation_events
     )
     beats_baseline = (
         hazard_metrics.balanced_accuracy
@@ -463,7 +474,7 @@ def select_temporal_model(
 
     if not enough_data:
         selected = "empirical"
-        reason = "insufficient replay events for richer hazard model"
+        reason = "insufficient confident replay events for richer hazard model"
     elif beats_baseline:
         selected = "hazard"
         reason = "hazard improved validation balanced accuracy"
