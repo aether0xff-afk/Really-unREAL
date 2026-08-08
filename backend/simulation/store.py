@@ -132,7 +132,7 @@ class SQLiteSimulationStore:
         return ScheduledEvent(
             event_id=event_id,
             twin_person_id=twin_person_id,
-            platform=platform,
+            platform=self.platform if hasattr(self, "platform") else platform,
             conversation_id=conversation_id,
             action=action,
             due_at=due_at,
@@ -244,6 +244,32 @@ class SQLiteSimulationStore:
             )
             for row in rows
         ]
+
+    def clear_conversation(
+        self,
+        *,
+        twin_person_id: str,
+        platform: str,
+        conversation_id: str,
+    ) -> None:
+        """Clear only SIMULATION state for one live conversation.
+
+        Imported REAL evidence is not stored in this database and therefore can
+        never be deleted by this operation.
+        """
+
+        with self._connect() as db:
+            db.execute(
+                "UPDATE scheduled_events SET status='CANCELLED' "
+                "WHERE twin_person_id=? AND platform=? AND conversation_id=? "
+                "AND status='PENDING'",
+                (twin_person_id, platform, conversation_id),
+            )
+            db.execute(
+                "DELETE FROM simulation_messages WHERE twin_person_id=? AND platform=? "
+                "AND conversation_id=?",
+                (twin_person_id, platform, conversation_id),
+            )
 
     @staticmethod
     def _scheduled_from_row(row: sqlite3.Row) -> ScheduledEvent:
