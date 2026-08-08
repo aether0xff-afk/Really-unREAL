@@ -13,6 +13,10 @@ from backend.replay import (
     build_replay_cases,
     chronological_split,
 )
+from backend.replay_baseline import (
+    EmpiricalTimingBaseline,
+    evaluate_empirical_baseline,
+)
 
 
 def main() -> None:
@@ -30,6 +34,12 @@ def main() -> None:
         "--include-group",
         action="store_true",
         help="Include only user-addressable labels from group conversations",
+    )
+    parser.add_argument(
+        "--baseline-quantile",
+        type=float,
+        default=0.5,
+        help="Empirical timing quantile used by the simple baseline",
     )
     args = parser.parse_args()
 
@@ -59,6 +69,22 @@ def main() -> None:
     snapshots = build_action_snapshots(cases)
     split = chronological_split(cases) if cases else None
 
+    baseline_output: dict[str, object] | None = None
+    if split is not None and split.train and split.test:
+        baseline = EmpiricalTimingBaseline.fit(
+            split.train,
+            quantile=args.baseline_quantile,
+        )
+        test_snapshots = build_action_snapshots(split.test)
+        baseline_output = {
+            "thresholds": baseline.thresholds_dict(),
+            "test_metrics": evaluate_empirical_baseline(
+                baseline,
+                split.test,
+                test_snapshots,
+            ).to_dict(),
+        }
+
     output: dict[str, object] = {
         "person_id": args.person_id,
         "include_group": args.include_group,
@@ -72,6 +98,7 @@ def main() -> None:
             if split is not None
             else {"train": 0, "validation": 0, "test": 0}
         ),
+        "empirical_timing_baseline": baseline_output,
         "privacy": (
             "This audit reports counts/timing only. Hidden real message text is not "
             "printed by default."
