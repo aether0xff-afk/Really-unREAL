@@ -27,12 +27,15 @@ class HistoricalExample:
     context_texts: tuple[str, ...]
     target_texts: tuple[str, ...]
     burst_size: int
+    action_is_ambiguous: bool = False
 
 
 @dataclass(frozen=True, slots=True)
 class RetrievedExample:
     example: HistoricalExample
     score: float
+    # Kept for compatibility with earlier callers. This is a lexical proxy,
+    # not a learned embedding/semantic score.
     semantic_similarity: float
     recency_score: float
 
@@ -64,6 +67,7 @@ def historical_examples_from_replay(
                 if message.message.text
             ),
             burst_size=case.burst_size,
+            action_is_ambiguous=case.action_is_ambiguous,
         )
         for case in cases
     ]
@@ -104,7 +108,9 @@ def _counter_cosine(left: Counter[str], right: Counter[str]) -> float:
     return dot / (left_norm * right_norm)
 
 
-def _semantic_similarity(query_text: str, candidate_text: str) -> float:
+def _lexical_similarity(query_text: str, candidate_text: str) -> float:
+    """Cheap local similarity fallback, deliberately not called an embedding."""
+
     char_similarity = _counter_cosine(
         _char_ngrams(query_text),
         _char_ngrams(candidate_text),
@@ -119,12 +125,13 @@ def _recency_score(candidate_at: datetime, cutoff: datetime) -> float:
 
 
 class CutoffExampleIndex:
-    """Historical response examples with a hard temporal retrieval cutoff.
+    """Historical examples with a hard temporal retrieval cutoff.
 
     The index may be constructed from the full replay corpus for convenience,
     but ``search`` only considers examples whose real target action occurred
-    strictly before the requested cutoff. This is the central anti-leakage
-    invariant for Historical Replay RAG.
+    strictly before the requested cutoff. The current implementation uses a
+    lexical similarity proxy; a future embedding backend can replace the scorer
+    without changing the cutoff contract.
     """
 
     def __init__(self, examples: Iterable[HistoricalExample]) -> None:
@@ -154,6 +161,7 @@ class CutoffExampleIndex:
         k: int = 5,
         context_messages: int = 6,
         minimum_score: float = 0.0,
+        action: Action | None = None,
     ) -> list[RetrievedExample]:
         if k < 1:
             return []
@@ -183,6 +191,12 @@ class CutoffExampleIndex:
             # cannot safely be assumed to have happened first.
             if example.action_at >= cutoff:
                 continue
+            if action is not None:
+                # Long-gap examples cannot safely tell us REPLY vs INITIATE, so
+                # they are excluded when the caller requests an action-specific
+                # retrieval bucket.
+                if example.action_is_ambiguous or example.action != action:
+                    continue
             if (
                 example.conversation_id == case.conversation_id
                 and example.action_at in visible_timestamps
@@ -192,10 +206,10 @@ class CutoffExampleIndex:
                 continue
 
             candidate_text = _normalized_text(example.context_texts)
-            semantic = _semantic_similarity(query_text, candidate_text)
+            lexical = _lexical_similarity(query_text, candidate_text)
             recency = _recency_score(example.action_at, cutoff)
             source_weight = max(0.0, float(example.evidence_weight))
-            score = source_weight * (0.85 * semantic + 0.15 * recency)
+            score = source_weight * (0.85 * lexical + 0.15 * recency)
             if example.platform == case.platform:
                 score *= 1.05
             if score < minimum_score:
@@ -204,7 +218,7 @@ class CutoffExampleIndex:
                 RetrievedExample(
                     example=example,
                     score=score,
-                    semantic_similarity=semantic,
+                    semantic_similarity=lexical,
                     recency_score=recency,
                 )
             )
