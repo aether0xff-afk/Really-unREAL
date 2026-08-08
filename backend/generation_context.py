@@ -9,6 +9,7 @@ from backend.persona.cutoff import CutoffLanguageProfile, build_cutoff_language_
 from backend.replay import ReplayCase
 from backend.retrieval import CutoffExampleIndex, RetrievedExample
 from backend.simulation.action_policy import Action
+from backend.topic_memory import TopicMemorySnapshot, build_topic_memory
 
 
 _LAUGH_RE = re.compile(r"ㅋ{2,}|ㅎ{2,}")
@@ -54,6 +55,7 @@ class GenerationContextPacket:
     language_profile: CutoffLanguageProfile
     retrieved_examples: tuple[RetrievedGenerationExample, ...]
     action_role_ambiguous: bool = False
+    topic_memory: TopicMemorySnapshot | None = None
 
     def to_dict(self) -> dict[str, object]:
         return asdict(self)
@@ -109,19 +111,26 @@ def build_generation_context(
     visible_context_messages: int = 12,
     raw_response_examples: int = 0,
     action_specific_retrieval: bool = True,
+    relationship_focus_multiplier: float = 2.0,
+    topic_horizon_days: float = 120.0,
 ) -> GenerationContextPacket:
     """Build everything a future language model may see for one action.
 
     The caller must supply ``chosen_action`` from the temporal policy. The real
     held-out ``case.action`` and ``case.target_burst`` are intentionally never
     read here, keeping temporal choice and language generation separated.
-    Persona statistics and RAG examples are both cut off strictly before the
-    replay observation time.
+    Persona statistics, topic memory, and RAG examples are all cut off strictly
+    before the replay observation time.
 
     Historical *response text* is withheld by default. Retrieval exposes the
     old context plus response shape/style statistics, which gives the model
     behavioural evidence without handing it a sentence to copy. Set
     ``raw_response_examples`` only for an explicit ablation.
+
+    Persona statistics are relationship-conditioned: messages from the current
+    conversation get an observable evidence boost while global history remains a
+    fallback. This is especially important for SELF_TWIN, where one person may
+    write differently to different friends.
 
     For a long-gap case whose REPLY-vs-INITIATE role is ambiguous, callers should
     set ``action_specific_retrieval=False`` so an uncertain proxy label does not
@@ -144,7 +153,20 @@ def build_generation_context(
         )
         for item in case.context[-visible_context_messages:]
     )
-    profile = build_cutoff_language_profile(evidence, case.observation_end)
+    profile = build_cutoff_language_profile(
+        evidence,
+        case.observation_end,
+        focus_conversation_id=case.conversation_id,
+        focus_platform=case.platform,
+        focus_weight_multiplier=relationship_focus_multiplier,
+    )
+    topic_memory = build_topic_memory(
+        evidence,
+        case.observation_end,
+        focus_conversation_id=case.conversation_id,
+        focus_platform=case.platform,
+        horizon_days=topic_horizon_days,
+    )
     retrieved = index.search(
         case,
         cutoff=case.observation_end,
@@ -163,4 +185,5 @@ def build_generation_context(
             raw_response_examples=raw_response_examples,
         ),
         action_role_ambiguous=case.action_is_ambiguous,
+        topic_memory=topic_memory,
     )
