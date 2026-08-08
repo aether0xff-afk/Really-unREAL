@@ -32,7 +32,9 @@ The current pipeline can:
 7. Build leakage-safe Historical Replay events with `WAIT / REPLY / INITIATE`, timing intervals, and message bursts.
 8. Split replay chronologically into train / validation / test.
 9. Fit/evaluate a weighted empirical timing baseline on held-out later replay events.
-10. Expose local audit tools without committing private source data.
+10. Fit a context-conditioned discrete hazard model and tune it on validation only.
+11. Fall back to the empirical model when the richer hazard model lacks enough history or fails to beat validation.
+12. Expose local audit tools without committing private source data.
 
 KakaoTalk text analysis:
 
@@ -74,7 +76,7 @@ python -m backend.replay_audit \
   person-001
 ```
 
-The replay audit also fits the simple training-split timing baseline and reports held-out test metrics.
+The replay audit reports empirical and hazard validation/test metrics plus the model chosen without using the test set for selection.
 
 Run tests with:
 
@@ -120,9 +122,11 @@ visible past
 
 KakaoTalk minute timestamps are treated as interval-censored rather than fake second-level truth. Direct conversations are the default action/timing benchmark; group messages remain useful supporting persona evidence but are excluded from behavioral labels unless explicitly requested.
 
-The first floor model is a weighted empirical timing quantile. It uses only visible action context and past timing statistics, with KakaoTalk carrying more evidence weight than supplemental Instagram data. More complex temporal models must beat this baseline on later held-out history.
+The first floor model is a weighted empirical timing quantile. The richer temporal model is a discrete survival/hazard model conditioned on visible conversation activity, time of day, weekday/weekend, source, and recent message gaps. The richer model is used only when chronological validation proves that it earns the extra complexity.
 
-See `docs/HISTORICAL_REPLAY.md` for the evaluation contract.
+A private-data development diagnostic across 13 sufficiently populated direct relationships improved macro test balanced accuracy from roughly `0.597` for the empirical baseline to `0.669` for hazard alone and `0.678` with validation-gated per-person selection. These are development diagnostics, not final benchmark claims.
+
+See `docs/HISTORICAL_REPLAY.md` and `docs/TEMPORAL_HAZARD.md` for the evaluation contract and temporal model.
 
 ## Architecture
 
@@ -144,6 +148,9 @@ Kakao / Instagram / other records
               +------> temporal profile
               |
               +------> Historical Replay
+              |             |
+              |             +--> empirical timing floor
+              |             +--> context-conditioned hazard
               |
               +------> contextual / interest evidence
                               |
@@ -167,10 +174,10 @@ The temporal/action layer sits **above** the language model. The model should no
 - **Phase 1.5:** source fusion and per-person identity resolution — scaffold implemented
 - **Phase 2A:** Historical Replay dataset/labels/splits — implemented
 - **Phase 2B:** weighted empirical timing baseline — implemented
-- **Phase 2B.1:** context-conditioned survival/hazard timing model — next
-- **Phase 2C:** cutoff-safe RAG + persona language generation
+- **Phase 2B.1:** context-conditioned survival/hazard timing model — implemented
+- **Phase 2C:** cutoff-safe RAG + persona language generation — next
 - **Phase 2D:** Kakao-only vs Kakao+Instagram ablation
 - **Phase 3:** shadow simulation against a past time interval
 - **Phase 4:** live real-time simulation with spontaneous initiation and long-term memory
 
-See `docs/IDENTITY_AND_FUSION.md`, `docs/HISTORICAL_REPLAY.md`, and the other documents in `docs/` for the detailed design and evaluation plan.
+See `docs/IDENTITY_AND_FUSION.md`, `docs/HISTORICAL_REPLAY.md`, `docs/TEMPORAL_HAZARD.md`, and the other documents in `docs/` for the detailed design and evaluation plan.
