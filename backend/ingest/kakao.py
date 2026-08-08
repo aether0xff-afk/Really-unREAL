@@ -69,6 +69,10 @@ def parse_kakao_text(text: str) -> list[ChatMessage]:
     day headers, and membership/system events are not emitted as user messages.
     Lines belonging to a multiline message are preserved, while trailing blank
     separator lines are removed when the message is flushed.
+
+    Kakao exports carry only minute-resolution timestamps. That precision is
+    recorded in metadata so replay evaluation can treat delay as an interval
+    instead of pretending a displayed ``12:03`` is exact to the second.
     """
 
     messages: list[ChatMessage] = []
@@ -86,6 +90,10 @@ def parse_kakao_text(text: str) -> list[ChatMessage]:
                 sender=pending["sender"],  # type: ignore[arg-type]
                 text=message_text,
                 source=MemorySource.REAL,
+                metadata={
+                    "platform": "kakao",
+                    "timestamp_precision_seconds": 60.0,
+                },
             )
         )
         pending = None
