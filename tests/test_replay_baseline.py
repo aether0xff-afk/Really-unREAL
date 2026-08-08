@@ -84,7 +84,6 @@ def test_weighted_baseline_keeps_primary_kakao_from_being_outvoted_by_supplement
 
     baseline = EmpiricalTimingBaseline.fit(cases, minimum_bucket_events=5)
 
-    # Weighted median of the action bucket stays at the primary Kakao sample.
     assert baseline.action_thresholds[Action.REPLY] == 60.0
 
 
@@ -110,6 +109,25 @@ def test_baseline_predicts_wait_until_empirical_threshold() -> None:
 
     assert baseline.predict_action(case, elapsed_seconds=60) == Action.WAIT
     assert baseline.predict_action(case, elapsed_seconds=300) == Action.REPLY
+
+
+def test_coarse_same_minute_delay_is_not_fitted_as_literal_zero_seconds() -> None:
+    case = _case(
+        "coarse",
+        platform="kakao",
+        previous_person_id="self",
+        delay_seconds=0,
+        weight=1.0,
+    )
+    case = replace(
+        case,
+        delay_lower_seconds=0.0,
+        delay_upper_seconds=60.0,
+    )
+
+    baseline = EmpiricalTimingBaseline.fit([case])
+
+    assert baseline.action_thresholds[Action.REPLY] == 30.0
 
 
 def test_interval_aware_metric_does_not_penalize_prediction_inside_censored_range() -> None:
