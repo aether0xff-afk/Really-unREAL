@@ -83,12 +83,12 @@ def _interval_error_seconds(prediction: float, case: ReplayCase) -> float:
 
 
 class EmpiricalTimingBaseline:
-    """Weighted empirical median timing baseline.
+    """Weighted empirical timing baseline with conservative backoff.
 
-    This is intentionally simple. It learns only when the target usually acts,
-    conditioned on the *observable* next-action type and, when enough samples
-    exist, platform. Evidence weights make KakaoTalk primary and Instagram
-    supplemental without duplicating data.
+    Timing is conditioned, when enough data exists, on the current direct
+    relationship before backing off to platform/action and then global timing.
+    This matters for SELF_TWIN because one person may answer different friends at
+    very different speeds.
 
     Coarse timestamp observations are fitted with the center of their feasible
     delay interval rather than a fake exact timestamp. Long-gap events whose
@@ -101,12 +101,16 @@ class EmpiricalTimingBaseline:
         *,
         quantile: float,
         minimum_bucket_events: int,
+        minimum_conversation_events: int,
+        conversation_thresholds: dict[tuple[str, Action], float],
         platform_thresholds: dict[tuple[str, Action], float],
         action_thresholds: dict[Action, float],
         global_threshold: float,
     ) -> None:
         self.quantile = quantile
         self.minimum_bucket_events = minimum_bucket_events
+        self.minimum_conversation_events = minimum_conversation_events
+        self.conversation_thresholds = dict(conversation_thresholds)
         self.platform_thresholds = dict(platform_thresholds)
         self.action_thresholds = dict(action_thresholds)
         self.global_threshold = float(global_threshold)
@@ -118,12 +122,15 @@ class EmpiricalTimingBaseline:
         *,
         quantile: float = 0.5,
         minimum_bucket_events: int = 5,
+        minimum_conversation_events: int = 8,
     ) -> "EmpiricalTimingBaseline":
         cases = list(cases)
         if not cases:
             raise ValueError("cannot fit timing baseline without replay cases")
         if minimum_bucket_events < 1:
             raise ValueError("minimum_bucket_events must be >= 1")
+        if minimum_conversation_events < 1:
+            raise ValueError("minimum_conversation_events must be >= 1")
 
         global_samples = [
             (_representative_training_delay_seconds(case), case.evidence_weight)
@@ -144,19 +151,30 @@ class EmpiricalTimingBaseline:
                 action_thresholds[action] = _weighted_quantile(bucket, quantile)
 
         platform_thresholds: dict[tuple[str, Action], float] = {}
-        buckets: dict[tuple[str, Action], list[tuple[float, float]]] = {}
+        platform_buckets: dict[tuple[str, Action], list[tuple[float, float]]] = {}
+        conversation_thresholds: dict[tuple[str, Action], float] = {}
+        conversation_buckets: dict[tuple[str, Action], list[tuple[float, float]]] = {}
         for case in confident_cases:
             action = _observable_candidate_action(case)
-            buckets.setdefault((case.platform, action), []).append(
-                (_representative_training_delay_seconds(case), case.evidence_weight)
+            sample = (
+                _representative_training_delay_seconds(case),
+                case.evidence_weight,
             )
-        for key, bucket in buckets.items():
+            platform_buckets.setdefault((case.platform, action), []).append(sample)
+            conversation_buckets.setdefault((case.conversation_id, action), []).append(sample)
+
+        for key, bucket in platform_buckets.items():
             if len(bucket) >= minimum_bucket_events:
                 platform_thresholds[key] = _weighted_quantile(bucket, quantile)
+        for key, bucket in conversation_buckets.items():
+            if len(bucket) >= minimum_conversation_events:
+                conversation_thresholds[key] = _weighted_quantile(bucket, quantile)
 
         return cls(
             quantile=quantile,
             minimum_bucket_events=minimum_bucket_events,
+            minimum_conversation_events=minimum_conversation_events,
+            conversation_thresholds=conversation_thresholds,
             platform_thresholds=platform_thresholds,
             action_thresholds=action_thresholds,
             global_threshold=global_threshold,
@@ -164,9 +182,12 @@ class EmpiricalTimingBaseline:
 
     def predict_delay_seconds(self, case: ReplayCase) -> float:
         action = _observable_candidate_action(case)
-        return self.platform_thresholds.get(
-            (case.platform, action),
-            self.action_thresholds.get(action, self.global_threshold),
+        return self.conversation_thresholds.get(
+            (case.conversation_id, action),
+            self.platform_thresholds.get(
+                (case.platform, action),
+                self.action_thresholds.get(action, self.global_threshold),
+            ),
         )
 
     def predict_action(self, case: ReplayCase, *, elapsed_seconds: float) -> Action:
@@ -178,6 +199,7 @@ class EmpiricalTimingBaseline:
         return {
             "quantile": self.quantile,
             "minimum_bucket_events": self.minimum_bucket_events,
+            "minimum_conversation_events": self.minimum_conversation_events,
             "global_seconds": self.global_threshold,
             "by_action_seconds": {
                 action.value: value
@@ -186,6 +208,10 @@ class EmpiricalTimingBaseline:
             "by_platform_action_seconds": {
                 f"{platform}:{action.value}": value
                 for (platform, action), value in self.platform_thresholds.items()
+            },
+            "by_conversation_action_seconds": {
+                f"{conversation_id}:{action.value}": value
+                for (conversation_id, action), value in self.conversation_thresholds.items()
             },
         }
 
