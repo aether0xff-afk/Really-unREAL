@@ -12,6 +12,8 @@ def bundle_smoke() -> None:
     ZoneInfo("UTC")
     ZoneInfo("Asia/Seoul")
     import backend.gui_support  # noqa: F401
+    import backend.gui_runtime  # noqa: F401
+    import backend.gui_responsive  # noqa: F401
     import backend.ingest.instagram  # noqa: F401
     import backend.replay_generation  # noqa: F401
 
@@ -21,9 +23,9 @@ def main() -> None:
         bundle_smoke()
         return
 
-    from backend.gui import ReallyUnrealApp
+    from backend.gui_responsive import ResponsiveReallyUnrealApp
 
-    app = ReallyUnrealApp()
+    app = ResponsiveReallyUnrealApp()
     app.mainloop()
 
 
