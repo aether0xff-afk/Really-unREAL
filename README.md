@@ -22,7 +22,7 @@ v1.0.1 adds a small Windows-friendly desktop UI around the v1.0 research core.
 
 The portable executable does not require a separate Python installation. It does not install a background service and it does not send messages to KakaoTalk, Instagram, or any other real platform.
 
-For screenshots/step-by-step details, see `docs/QUICKSTART_GUI.md`.
+For step-by-step details, see `docs/QUICKSTART_GUI.md`.
 
 ### Run the GUI from source
 
@@ -30,7 +30,7 @@ Python 3.11+:
 
 ```bash
 python -m pip install -e '.[dev]'
-python -m backend.gui
+python -m backend.gui_entry
 ```
 
 Installing the package also exposes the `really-unreal` GUI entry point.
@@ -298,22 +298,23 @@ The v1.0.1 GUI is currently a replay/audit front door; it is not yet a full mess
 ```bash
 python -m pip install -e '.[dev,build]'
 pytest -q
-pyinstaller --noconfirm --clean --onefile --windowed --name Really-unREAL backend/gui.py
+pyinstaller --noconfirm --clean --onefile --windowed --name Really-unREAL backend/gui_entry.py
+./dist/Really-unREAL.exe --smoke
 ```
 
-The Windows workflow packages `Really-unREAL.exe` and `QUICKSTART.md` into `Really-unREAL-v1.0.1-Windows-x64.zip`.
+The Windows workflow packages `Really-unREAL.exe` and `QUICKSTART.md` into `Really-unREAL-v1.0.1-Windows-x64.zip`. Before packaging, it executes the bundled `--smoke` path to verify timezone resources and core replay imports survived PyInstaller bundling.
 
 ## Status
 
 **v1.0 simulation core:** implemented.  
-**v1.0.1 desktop usability layer:** in release validation.
+**v1.0.1 desktop usability layer:** Windows build validated.
 
 - Phase 1 — ingest/profiles: implemented
 - Phase 1.5 — identity/source fusion: implemented
 - Phase 2 — leakage-safe Historical Replay + generation evaluation: implemented
 - Phase 3 — closed-loop Shadow Simulation: implemented baseline
 - Phase 4 — persistent real-time discrete-event runtime: implemented core
-- v1.0.1 — desktop quick-start GUI + portable Windows build: validation branch
+- v1.0.1 — desktop quick-start GUI + portable Windows build: validated
 
 See `docs/QUICKSTART_GUI.md`, `docs/V1_0.md`, `docs/HISTORICAL_REPLAY.md`, `docs/TEMPORAL_HAZARD.md`, `docs/CUTOFF_RAG.md`, and `docs/SELF_TWIN.md`.
 
