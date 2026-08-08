@@ -162,6 +162,52 @@ def test_relevant_past_context_outranks_unrelated_context() -> None:
     assert results[0].semantic_similarity > results[1].semantic_similarity
 
 
+def test_dense_embedding_can_resolve_low_lexical_overlap() -> None:
+    class FakeEmbeddingProvider:
+        def embed(self, texts):
+            vectors = []
+            for text in texts:
+                if "시험" in text or "공부" in text:
+                    vectors.append((1.0, 0.0))
+                elif "저녁" in text or "치킨" in text:
+                    vectors.append((0.0, 1.0))
+                else:
+                    vectors.append((0.5, 0.5))
+            return vectors
+
+    semantically_related = _case(
+        "study",
+        action_at=BASE - timedelta(days=5),
+        context_text="시험 준비 끝?",
+        target_text="아직",
+        conversation_id="old-study",
+    )
+    unrelated = _case(
+        "dinner",
+        action_at=BASE - timedelta(days=1),
+        context_text="저녁 메뉴 정함?",
+        target_text="치킨",
+        conversation_id="old-dinner",
+    )
+    query = _case(
+        "query",
+        action_at=BASE + timedelta(minutes=5),
+        context_text="공부 다 했냐",
+        target_text="hidden",
+        conversation_id="query-thread",
+    )
+    index = CutoffExampleIndex.from_replay_cases(
+        [semantically_related, unrelated],
+        embedding_provider=FakeEmbeddingProvider(),
+    )
+
+    results = index.search(query, cutoff=BASE, k=2)
+
+    assert results[0].example.case_id == "study"
+    assert results[0].embedding_similarity == 1.0
+    assert results[0].semantic_similarity > results[0].lexical_similarity
+
+
 def test_kakao_primary_weight_breaks_equal_similarity_tie() -> None:
     kakao = _case(
         "kakao",
