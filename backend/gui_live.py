@@ -234,6 +234,37 @@ class LiveChatSession:
             action=action,
         )
 
+    def _ensure_read_for_new_bubble(
+        self,
+        *,
+        sent_at: datetime,
+        reply_due_at: datetime,
+    ) -> None:
+        # A future READ already covers any message sent before its due time. If
+        # the previous READ has already fired (or is overdue), schedule a separate
+        # inferred READ for the newly appended bubble without moving the old one.
+        covering = [
+            event
+            for event in self._active(Action.READ)
+            if event.status in {"PENDING", "RETRY"} and event.due_at >= sent_at
+        ]
+        if covering:
+            return
+        model = self.engine.read_timing_model
+        if model is None:
+            return
+        remaining = max(0.0, (reply_due_at - sent_at).total_seconds())
+        read_delay = model.sample_delay_seconds(remaining)
+        self.store.schedule(
+            twin_person_id=self.target_person_id,
+            platform="kakao",
+            conversation_id=self.conversation_id,
+            action=Action.READ,
+            due_at=min(reply_due_at, sent_at + timedelta(seconds=read_delay)),
+            created_at=sent_at,
+            replace_same_action=False,
+        )
+
     def send_user_message(
         self,
         text: str,
@@ -258,10 +289,9 @@ class LiveChatSession:
             },
         )
 
-        # Do not reset the person's sampled reply clock every time the user sends
-        # another bubble. If an unclaimed future REPLY already exists, let the new
-        # bubble join that observable turn and only enforce a tiny input-settle
-        # floor so generation cannot fire in the middle of rapid typing.
+        # A rapid multi-bubble user turn joins the existing unclaimed REPLY. The
+        # reply clock is not re-sampled; only a tiny settle floor prevents firing
+        # in the middle of typing.
         future_replies = [
             event
             for event in self._active(Action.REPLY)
@@ -276,11 +306,12 @@ class LiveChatSession:
                 )
             except KeyError:
                 pass
+            self._ensure_read_for_new_bubble(sent_at=now, reply_due_at=event.due_at)
             return event
 
         # A CLAIMED/RETRY/BLOCKED old reply belongs to its original causal cutoff.
-        # A later user message therefore gets a separate behavior decision instead
-        # of cancelling or mutating that in-flight action.
+        # A later user message gets a separate behavior decision and cannot cancel
+        # or mutate that in-flight action.
         has_old_reply = bool(self._active(Action.REPLY))
         return self.engine.observe_counterpart_message(
             observed_at=now,
