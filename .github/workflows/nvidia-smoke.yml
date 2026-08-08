@@ -1,0 +1,34 @@
+name: NVIDIA NIM smoke
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/nvidia-smoke.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  hosted-nim-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install project
+        run: python -m pip install -e .
+      - name: Verify secret is configured
+        shell: bash
+        run: |
+          if [ -z "$NVIDIA_API_KEY" ]; then
+            echo "NVIDIA_API_KEY repository secret is missing."
+            exit 1
+          fi
+      - name: Call hosted NVIDIA NIM with synthetic context
+        run: python -m backend.nvidia_smoke
