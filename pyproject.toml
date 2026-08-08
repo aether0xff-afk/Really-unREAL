@@ -14,7 +14,7 @@ dev = ["pytest>=8"]
 build = ["pyinstaller>=6.10"]
 
 [project.gui-scripts]
-really-unreal = "backend.gui:main"
+really-unreal = "backend.gui_entry:main"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
