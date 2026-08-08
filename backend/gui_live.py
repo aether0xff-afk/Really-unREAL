@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from backend.fusion import EvidenceContext, EvidenceMessage
@@ -74,14 +74,7 @@ def _language_model(
 
 
 class LiveChatSession:
-    """Desktop adapter around the persistent LiveSimulationEngine.
-
-    User-entered and model-generated messages are stored as SIMULATION only.
-    Historical Kakao messages remain REAL evidence and are never copied into the
-    live database. The engine schedules reply/initiation time before generation.
-    Live delays are sampled from historical replay intervals rather than reusing
-    a single median delay on every turn.
-    """
+    """Desktop adapter around the persistent LiveSimulationEngine."""
 
     def __init__(
         self,
@@ -169,8 +162,6 @@ class LiveChatSession:
         ]
 
     def _visible_context(self) -> tuple[EvidenceMessage, ...]:
-        # A short real tail grounds the current relationship while retrieval and
-        # persona builders can still use the full REAL evidence set separately.
         historical = tuple(self.historical_conversation.messages[-40:])
         simulated = tuple(
             EvidenceMessage(
@@ -226,6 +217,39 @@ class LiveChatSession:
         after = messages[-1].timestamp if messages else now
         return self.engine.schedule_idle_initiation(after=after)
 
+    def defer_generation_failure(
+        self,
+        error: Exception,
+        *,
+        now: datetime | None = None,
+    ) -> ScheduledEvent | None:
+        event = self.pending_event()
+        if event is None:
+            return None
+        now = now or datetime.now()
+        delays = (5, 15, 30, 60, 120, 300)
+        retry_seconds = delays[min(event.generation_attempts, len(delays) - 1)]
+        return self.store.defer_event(
+            event.event_id,
+            retry_at=now + timedelta(seconds=retry_seconds),
+            error=str(error),
+        )
+
+    def block_generation_failure(self, error: Exception) -> ScheduledEvent | None:
+        event = self.pending_event()
+        if event is None:
+            return None
+        return self.store.block_event(event.event_id, error=str(error))
+
+    def retry_blocked(self, *, now: datetime | None = None) -> ScheduledEvent | None:
+        event = self.pending_event()
+        if event is None or event.status != "BLOCKED":
+            return event
+        return self.store.retry_blocked_event(
+            event.event_id,
+            retry_at=now or datetime.now(),
+        )
+
     def cancel_pending(self) -> None:
         self.store.cancel_pending(
             twin_person_id=self.target_person_id,
@@ -244,12 +268,16 @@ class LiveChatSession:
         event = self.pending_event()
         if event is None:
             return "대기 중"
+        if event.status == "BLOCKED":
+            return "답장 행동 보존됨 · 모델 설정 확인 후 재시도"
         now = now or datetime.now()
         remaining = max(0, int((event.due_at - now).total_seconds()))
         if event.action == Action.REPLY:
             prefix = "답장 예정"
         else:
             prefix = "먼저 메시지 가능성"
+        if event.status == "RETRY":
+            prefix += " · 생성 재시도"
         if remaining < 60:
             return f"{prefix} · 약 {remaining}초 후"
         minutes = remaining // 60
