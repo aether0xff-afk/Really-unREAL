@@ -26,7 +26,7 @@ def _evidence(at: datetime, sender: str, text: str) -> EvidenceMessage:
 def _case() -> ReplayCase:
     visible = _evidence(BASE, "self", "뭐함")
     first = _evidence(BASE + timedelta(minutes=2), "target", "집ㅋㅋ")
-    second = _evidence(BASE + timedelta(minutes=2, seconds=30), "target", "왜")
+    second = _evidence(BASE + timedelta(minutes=2, seconds=30), "target", "왜?")
     return ReplayCase(
         case_id="case",
         person_id="target",
@@ -48,9 +48,9 @@ def _case() -> ReplayCase:
 
 
 def test_generated_burst_accepts_messages_only_json() -> None:
-    burst = GeneratedBurst.from_json('{"messages": ["집ㅋㅋ", "왜"]}')
+    burst = GeneratedBurst.from_json('{"messages": ["집ㅋㅋ", "왜?"]}')
 
-    assert burst.messages == ("집ㅋㅋ", "왜")
+    assert burst.messages == ("집ㅋㅋ", "왜?")
 
 
 def test_generated_burst_rejects_empty_or_wrong_shape() -> None:
@@ -60,13 +60,17 @@ def test_generated_burst_rejects_empty_or_wrong_shape() -> None:
         GeneratedBurst.from_json('{"messages": []}')
 
 
-def test_generation_metrics_are_computed_only_after_output_exists() -> None:
+def test_generation_metrics_separate_content_and_style() -> None:
     metrics = evaluate_generated_burst(
-        GeneratedBurst(("집ㅋㅋ", "왜")),
+        GeneratedBurst(("집ㅋㅋ", "왜?")),
         _case(),
     )
 
     assert metrics.burst_size_absolute_error == 0
     assert metrics.total_char_length_absolute_error == 0
     assert metrics.char_bigram_f1 == 1.0
+    assert metrics.token_f1 == 1.0
+    assert metrics.ending_f1 == 1.0
     assert metrics.laugh_presence_match is True
+    assert metrics.cry_presence_match is True
+    assert metrics.question_presence_match is True
