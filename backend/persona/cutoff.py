@@ -4,7 +4,6 @@ import re
 from collections import defaultdict
 from dataclasses import asdict, dataclass
 from datetime import datetime
-from typing import Iterable
 
 from backend.fusion import EvidenceMessage, PersonEvidence
 
@@ -12,6 +11,7 @@ from backend.fusion import EvidenceMessage, PersonEvidence
 _TOKEN_RE = re.compile(r"[0-9A-Za-z가-힣ㅋㅎㅠㅜ]+")
 _LAUGH_RE = re.compile(r"ㅋ{2,}|ㅎ{2,}")
 _CRY_RE = re.compile(r"ㅠ{2,}|ㅜ{2,}")
+_TERMINAL_PUNCTUATION = ".?!~…"
 
 
 @dataclass(frozen=True, slots=True)
@@ -26,10 +26,16 @@ class CutoffLanguageProfile:
     weighted_cry_expression_ratio: float | None
     frequent_tokens: tuple[tuple[str, float], ...]
     platform_message_counts: dict[str, int]
+    weighted_question_ratio: float | None = None
+    weighted_exclamation_ratio: float | None = None
+    weighted_no_terminal_punctuation_ratio: float | None = None
+    weighted_multiline_ratio: float | None = None
+    frequent_endings: tuple[tuple[str, float], ...] = ()
 
     def to_dict(self) -> dict[str, object]:
         data = asdict(self)
         data["frequent_tokens"] = [list(item) for item in self.frequent_tokens]
+        data["frequent_endings"] = [list(item) for item in self.frequent_endings]
         return data
 
 
@@ -53,47 +59,83 @@ def target_messages_before(
     )
 
 
+def _ending_fragment(text: str) -> str:
+    compact = re.sub(r"\s+", " ", text.strip())
+    if not compact:
+        return ""
+    # Keep punctuation because whether a person habitually ends with ?, ~, etc.
+    # is itself observable style. Two characters avoid exposing whole long
+    # historical responses as persona examples.
+    return compact[-2:]
+
+
 def build_cutoff_language_profile(
     evidence: PersonEvidence,
     cutoff: datetime,
     *,
     top_k: int = 12,
+    ending_top_k: int = 8,
 ) -> CutoffLanguageProfile:
     if top_k < 1:
         raise ValueError("top_k must be >= 1")
+    if ending_top_k < 1:
+        raise ValueError("ending_top_k must be >= 1")
 
     messages = target_messages_before(evidence, cutoff)
     total_weight = sum(max(0.0, item.evidence_weight) for item in messages)
     platform_counts: defaultdict[str, int] = defaultdict(int)
     token_weights: defaultdict[str, float] = defaultdict(float)
+    ending_weights: defaultdict[str, float] = defaultdict(float)
 
     weighted_length = 0.0
     short_weight = 0.0
     laugh_weight = 0.0
     cry_weight = 0.0
+    question_weight = 0.0
+    exclamation_weight = 0.0
+    no_terminal_punctuation_weight = 0.0
+    multiline_weight = 0.0
 
     for item in messages:
         weight = max(0.0, float(item.evidence_weight))
         platform_counts[item.platform] += 1
         text = item.message.text
+        stripped = text.strip()
         weighted_length += len(text) * weight
         short_weight += (len(text) <= 5) * weight
         laugh_weight += bool(_LAUGH_RE.search(text)) * weight
         cry_weight += bool(_CRY_RE.search(text)) * weight
+        question_weight += ("?" in text) * weight
+        exclamation_weight += ("!" in text) * weight
+        no_terminal_punctuation_weight += (
+            bool(stripped) and stripped[-1] not in _TERMINAL_PUNCTUATION
+        ) * weight
+        multiline_weight += ("\n" in text) * weight
         for token in _TOKEN_RE.findall(text.lower()):
             if token.strip():
                 token_weights[token] += weight
+        ending = _ending_fragment(text)
+        if ending:
+            ending_weights[ending] += weight
 
     if total_weight > 0:
         mean_length = weighted_length / total_weight
         short_ratio = short_weight / total_weight
         laugh_ratio = laugh_weight / total_weight
         cry_ratio = cry_weight / total_weight
+        question_ratio = question_weight / total_weight
+        exclamation_ratio = exclamation_weight / total_weight
+        no_terminal_punctuation_ratio = no_terminal_punctuation_weight / total_weight
+        multiline_ratio = multiline_weight / total_weight
     else:
         mean_length = None
         short_ratio = None
         laugh_ratio = None
         cry_ratio = None
+        question_ratio = None
+        exclamation_ratio = None
+        no_terminal_punctuation_ratio = None
+        multiline_ratio = None
 
     frequent_tokens = tuple(
         sorted(
@@ -101,24 +143,30 @@ def build_cutoff_language_profile(
             key=lambda item: (-item[1], item[0]),
         )[:top_k]
     )
+    frequent_endings = tuple(
+        sorted(
+            ending_weights.items(),
+            key=lambda item: (-item[1], item[0]),
+        )[:ending_top_k]
+    )
+
+    def rounded(value: float | None, digits: int = 4) -> float | None:
+        return round(value, digits) if value is not None else None
 
     return CutoffLanguageProfile(
         person_id=evidence.person_id,
         cutoff=cutoff.isoformat(),
         message_count=len(messages),
         effective_message_weight=round(total_weight, 4),
-        weighted_mean_char_length=(
-            round(mean_length, 3) if mean_length is not None else None
-        ),
-        weighted_short_message_ratio=(
-            round(short_ratio, 4) if short_ratio is not None else None
-        ),
-        weighted_laugh_expression_ratio=(
-            round(laugh_ratio, 4) if laugh_ratio is not None else None
-        ),
-        weighted_cry_expression_ratio=(
-            round(cry_ratio, 4) if cry_ratio is not None else None
-        ),
+        weighted_mean_char_length=rounded(mean_length, 3),
+        weighted_short_message_ratio=rounded(short_ratio),
+        weighted_laugh_expression_ratio=rounded(laugh_ratio),
+        weighted_cry_expression_ratio=rounded(cry_ratio),
         frequent_tokens=frequent_tokens,
         platform_message_counts=dict(platform_counts),
+        weighted_question_ratio=rounded(question_ratio),
+        weighted_exclamation_ratio=rounded(exclamation_ratio),
+        weighted_no_terminal_punctuation_ratio=rounded(no_terminal_punctuation_ratio),
+        weighted_multiline_ratio=rounded(multiline_ratio),
+        frequent_endings=frequent_endings,
     )
