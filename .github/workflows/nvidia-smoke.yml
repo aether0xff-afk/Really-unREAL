@@ -83,14 +83,14 @@ jobs:
             if (conversationSuccess && fs.existsSync('nvidia-conversation-smoke.json')) {
               const data = JSON.parse(fs.readFileSync('nvidia-conversation-smoke.json', 'utf8'));
               for (const turn of data.turns) {
-                const text = (turn.target || []).join(' / ').slice(0, 130) || '(empty)';
+                const text = (turn.target || []).join(' / ').replace(/\s+/g, ' ').slice(0, 78) || '(empty)';
                 await github.rest.repos.createCommitStatus({
                   owner: context.repo.owner,
                   repo: context.repo.repo,
                   sha: context.sha,
                   state: 'success',
-                  context: `nvidia-turn-${turn.turn}`,
-                  description: text
+                  context: `turn-${turn.turn}|${text}`,
+                  description: `Synthetic NVIDIA conversation turn ${turn.turn}`
                 });
               }
             }
