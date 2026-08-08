@@ -13,6 +13,7 @@ from backend.generation_context import (
 )
 from backend.persona.cutoff import CutoffLanguageProfile
 from backend.providers.nvidia import NvidiaNIMLanguageModel
+from backend.topic_memory import ObservableTopicCue, TopicMemorySnapshot
 
 
 USER_TURNS = (
@@ -39,6 +40,32 @@ def _profile() -> CutoffLanguageProfile:
         weighted_exclamation_ratio=0.01,
         weighted_no_terminal_punctuation_ratio=0.94,
         frequent_endings=(("ㅋㅋ", 32.0), ("ㅇㅇ", 18.0), ("아님", 9.0)),
+        profile_scope="relationship_blend",
+        focused_message_count=80,
+        focus_weight_multiplier=2.0,
+    )
+
+
+def _topic_memory(now: datetime) -> TopicMemorySnapshot:
+    return TopicMemorySnapshot(
+        cutoff=now.isoformat(),
+        horizon_days=120.0,
+        cues=(
+            ObservableTopicCue(
+                token="과제",
+                score=3.2,
+                mention_count=8,
+                focused_mention_count=6,
+                last_seen_at=(now - timedelta(days=1)).isoformat(),
+            ),
+            ObservableTopicCue(
+                token="학교",
+                score=2.4,
+                mention_count=6,
+                focused_mention_count=5,
+                last_seen_at=(now - timedelta(days=2)).isoformat(),
+            ),
+        ),
     )
 
 
@@ -115,6 +142,7 @@ def main() -> None:
             visible_context=tuple(visible[-12:]),
             language_profile=profile,
             retrieved_examples=examples,
+            topic_memory=_topic_memory(now),
         )
         burst = model.generate_burst(packet)
         transcript.append(
@@ -140,6 +168,7 @@ def main() -> None:
         "model": model.model,
         "synthetic_persona": True,
         "raw_retrieved_responses": False,
+        "topic_memory": True,
         "turns": transcript,
     }
     result_path = Path(os.environ.get("RESULT_PATH", "nvidia-conversation-smoke.json"))
