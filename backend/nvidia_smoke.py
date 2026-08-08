@@ -5,6 +5,7 @@ import json
 from backend.generation_context import (
     GenerationContextPacket,
     RetrievedGenerationExample,
+    RetrievedResponseShape,
     VisibleGenerationMessage,
 )
 from backend.persona.cutoff import CutoffLanguageProfile
@@ -35,23 +36,39 @@ def _synthetic_packet() -> GenerationContextPacket:
             weighted_cry_expression_ratio=0.02,
             frequent_tokens=(("ㅋㅋ", 9.0), ("아니", 4.0), ("근데", 3.0)),
             platform_message_counts={"kakao": 30},
+            weighted_question_ratio=0.08,
+            weighted_exclamation_ratio=0.01,
+            weighted_no_terminal_punctuation_ratio=0.91,
+            frequent_endings=(("ㅋㅋ", 8.0), ("ㅇㅇ", 3.0)),
         ),
         retrieved_examples=(
             RetrievedGenerationExample(
                 platform="kakao",
                 action="REPLY",
                 context_texts=("뭐해",),
-                response_texts=("집",),
                 burst_size=1,
                 retrieval_score=0.82,
+                response_shape=RetrievedResponseShape(
+                    message_lengths=(1,),
+                    question_count=0,
+                    laugh_expression_count=0,
+                    cry_expression_count=0,
+                    endings=("집",),
+                ),
             ),
             RetrievedGenerationExample(
                 platform="kakao",
                 action="REPLY",
                 context_texts=("지금 뭐함",),
-                response_texts=("누워있음ㅋㅋ",),
                 burst_size=1,
                 retrieval_score=0.77,
+                response_shape=RetrievedResponseShape(
+                    message_lengths=(6,),
+                    question_count=0,
+                    laugh_expression_count=1,
+                    cry_expression_count=0,
+                    endings=("ㅋㅋ",),
+                ),
             ),
         ),
     )
