@@ -1,5 +1,6 @@
 from datetime import datetime, timedelta
 
+from backend.gui_entry import bundle_smoke
 from backend.gui_support import (
     build_quick_identity_map,
     direct_targets_for_self,
@@ -53,3 +54,7 @@ def test_quick_identity_map_marks_confirmed_alias_as_self() -> None:
     assert identities.resolve("kakao", "나") == "self"
     assert identities.resolve("kakao", "A") is not None
     assert identities.resolve("kakao", "A") != "self"
+
+
+def test_bundle_smoke_imports_packaged_resources() -> None:
+    bundle_smoke()
