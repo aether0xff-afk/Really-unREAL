@@ -1,5 +1,5 @@
 """Really-unREAL conversation-behavior simulation core."""
 
-__version__ = "1.0.2"
+__version__ = "1.0.3"
 
 __all__ = ["__version__"]
