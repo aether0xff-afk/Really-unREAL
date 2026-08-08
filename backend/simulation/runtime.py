@@ -246,6 +246,21 @@ class LiveSimulationEngine:
             event_context = tuple(
                 item for item in visible_context if item.message.timestamp <= event.due_at
             )
+
+            # Read state belongs to simulated behavior, not provider delivery.
+            # Once a REPLY behavior time is reached, the user messages visible to
+            # that reply are considered read even if generation later gets a 503.
+            # Retries are idempotent and preserve the original read timestamp.
+            if event.action == Action.REPLY:
+                self.store.mark_messages_read(
+                    twin_person_id=self.twin_person_id,
+                    platform=self.platform,
+                    conversation_id=self.conversation_id,
+                    sender_person_id="self",
+                    read_at=event.due_at,
+                    sent_before_or_at=event.due_at,
+                )
+
             case = _generation_case(
                 twin_person_id=self.twin_person_id,
                 platform=self.platform,
