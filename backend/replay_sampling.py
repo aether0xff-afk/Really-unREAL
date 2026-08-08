@@ -3,7 +3,9 @@ from __future__ import annotations
 import random
 from collections import defaultdict
 from collections.abc import Iterable, Sequence
+from datetime import datetime
 
+from backend.fusion import EvidenceMessage
 from backend.replay import ReplayCase
 from backend.simulation.action_policy import Action
 
@@ -21,17 +23,9 @@ def _observable_action(case: ReplayCase) -> Action:
 class EmpiricalTimingSampler:
     """Sample live delays from observed replay timing intervals.
 
-    Historical Replay stores a feasible delay interval rather than pretending a
-    coarse KakaoTalk timestamp is exact. Live simulation therefore samples an
-    observed case first, respecting evidence weights, and then samples uniformly
-    inside that case's feasible interval. A same-minute Kakao reply represented
-    as ``[0, 60]`` seconds becomes a real 0-60 second draw instead of the fixed
-    30-second midpoint used by the deterministic evaluation baseline.
-
-    Sampling backs off from the current conversation to platform/action and then
-    action-level evidence. Ambiguous REPLY-vs-INITIATE cases are excluded from
-    action-conditioned buckets rather than teaching the simulator a guessed
-    action role.
+    This remains the unconditional fallback. The optional live-context arguments
+    are accepted so the sampler satisfies the same protocol as the richer 1.1
+    contextual timing model without changing its historical sampling behavior.
     """
 
     def __init__(
@@ -76,7 +70,10 @@ class EmpiricalTimingSampler:
         platform: str,
         conversation_id: str,
         action: Action,
+        observed_at: datetime | None = None,
+        visible_context: Sequence[EvidenceMessage] = (),
     ) -> float | None:
+        _ = observed_at, visible_context
         if action == Action.WAIT:
             return None
 
