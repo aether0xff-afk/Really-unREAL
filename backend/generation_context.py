@@ -53,6 +53,7 @@ class GenerationContextPacket:
     visible_context: tuple[VisibleGenerationMessage, ...]
     language_profile: CutoffLanguageProfile
     retrieved_examples: tuple[RetrievedGenerationExample, ...]
+    action_role_ambiguous: bool = False
 
     def to_dict(self) -> dict[str, object]:
         return asdict(self)
@@ -107,6 +108,7 @@ def build_generation_context(
     retrieval_k: int = 5,
     visible_context_messages: int = 12,
     raw_response_examples: int = 0,
+    action_specific_retrieval: bool = True,
 ) -> GenerationContextPacket:
     """Build everything a future language model may see for one action.
 
@@ -120,6 +122,10 @@ def build_generation_context(
     old context plus response shape/style statistics, which gives the model
     behavioural evidence without handing it a sentence to copy. Set
     ``raw_response_examples`` only for an explicit ablation.
+
+    For a long-gap case whose REPLY-vs-INITIATE role is ambiguous, callers should
+    set ``action_specific_retrieval=False`` so an uncertain proxy label does not
+    select the wrong historical bucket.
     """
 
     if evidence.person_id != case.person_id:
@@ -143,7 +149,7 @@ def build_generation_context(
         case,
         cutoff=case.observation_end,
         k=retrieval_k,
-        action=chosen_action,
+        action=chosen_action if action_specific_retrieval else None,
     )
 
     return GenerationContextPacket(
@@ -156,4 +162,5 @@ def build_generation_context(
             retrieved,
             raw_response_examples=raw_response_examples,
         ),
+        action_role_ambiguous=case.action_is_ambiguous,
     )
