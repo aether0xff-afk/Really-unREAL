@@ -4,6 +4,7 @@ import re
 from dataclasses import asdict, dataclass
 from typing import Sequence
 
+from backend.event_memory import EventMemorySnapshot, build_event_memory
 from backend.fusion import PersonEvidence
 from backend.persona.cutoff import CutoffLanguageProfile, build_cutoff_language_profile
 from backend.replay import ReplayCase
@@ -41,8 +42,6 @@ class RetrievedGenerationExample:
     burst_size: int
     retrieval_score: float
     response_shape: RetrievedResponseShape
-    # Raw historical responses are withheld by default to prevent nearest-
-    # neighbour copying. This field exists only for explicit ablation/debug runs.
     response_texts: tuple[str, ...] = ()
 
 
@@ -56,6 +55,7 @@ class GenerationContextPacket:
     retrieved_examples: tuple[RetrievedGenerationExample, ...]
     action_role_ambiguous: bool = False
     topic_memory: TopicMemorySnapshot | None = None
+    event_memory: EventMemorySnapshot | None = None
 
     def to_dict(self) -> dict[str, object]:
         return asdict(self)
@@ -114,27 +114,11 @@ def build_generation_context(
     relationship_focus_multiplier: float = 2.0,
     topic_horizon_days: float = 120.0,
 ) -> GenerationContextPacket:
-    """Build everything a future language model may see for one action.
+    """Build a cutoff-safe packet for replay or simulation generation.
 
-    The caller must supply ``chosen_action`` from the temporal policy. The real
-    held-out ``case.action`` and ``case.target_burst`` are intentionally never
-    read here, keeping temporal choice and language generation separated.
-    Persona statistics, topic memory, and RAG examples are all cut off strictly
-    before the replay observation time.
-
-    Historical *response text* is withheld by default. Retrieval exposes the
-    old context plus response shape/style statistics, which gives the model
-    behavioural evidence without handing it a sentence to copy. Set
-    ``raw_response_examples`` only for an explicit ablation.
-
-    Persona statistics are relationship-conditioned: messages from the current
-    conversation get an observable evidence boost while global history remains a
-    fallback. This is especially important for SELF_TWIN, where one person may
-    write differently to different friends.
-
-    For a long-gap case whose REPLY-vs-INITIATE role is ambiguous, callers should
-    set ``action_specific_retrieval=False`` so an uncertain proxy label does not
-    select the wrong historical bucket.
+    The held-out target burst is never read here. Persona, retrieval, topic cues,
+    and explicit event/date cues all use observations strictly older than the
+    case cutoff. Historical response text is withheld unless an ablation opts in.
     """
 
     if evidence.person_id != case.person_id:
@@ -167,6 +151,12 @@ def build_generation_context(
         focus_platform=case.platform,
         horizon_days=topic_horizon_days,
     )
+    event_memory = build_event_memory(
+        evidence,
+        case.observation_end,
+        focus_conversation_id=case.conversation_id,
+        focus_platform=case.platform,
+    )
     retrieved = index.search(
         case,
         cutoff=case.observation_end,
@@ -186,4 +176,5 @@ def build_generation_context(
         ),
         action_role_ambiguous=case.action_is_ambiguous,
         topic_memory=topic_memory,
+        event_memory=event_memory,
     )
