@@ -27,6 +27,8 @@ class ReplayGenerationSummary:
     requested_cases: int
     generated_cases: int
     temporal_wait_misses: int
+    temporal_early_predictions: int
+    temporal_late_predictions: int
     mean_burst_size_absolute_error: float | None
     mean_total_char_length_absolute_error: float | None
     mean_char_bigram_f1: float | None
@@ -42,6 +44,8 @@ class ReplayGenerationSummary:
             "requested_cases": self.requested_cases,
             "generated_cases": self.generated_cases,
             "temporal_wait_misses": self.temporal_wait_misses,
+            "temporal_early_predictions": self.temporal_early_predictions,
+            "temporal_late_predictions": self.temporal_late_predictions,
             "mean_burst_size_absolute_error": self.mean_burst_size_absolute_error,
             "mean_total_char_length_absolute_error": self.mean_total_char_length_absolute_error,
             "mean_char_bigram_f1": self.mean_char_bigram_f1,
@@ -83,6 +87,15 @@ def _mean(values: list[float]) -> float | None:
     return round(statistics.fmean(values), 6) if values else None
 
 
+def _candidate_action(case: ReplayCase) -> Action:
+    """Infer REPLY vs INITIATE strictly from visible context."""
+
+    if not case.context:
+        raise ValueError("ReplayCase has no visible context")
+    previous_sender = case.context[-1].sender_person_id
+    return Action.INITIATE if previous_sender == case.person_id else Action.REPLY
+
+
 def run_nvidia_replay(
     *,
     evidence: PersonEvidence,
@@ -115,24 +128,26 @@ def run_nvidia_replay(
     bigram_scores: list[float] = []
     laugh_matches: list[float] = []
     cry_matches: list[float] = []
-    temporal_wait_misses = 0
+    temporal_early_predictions = 0
+    temporal_late_predictions = 0
 
     for case in requested:
         if selection.selected_model == "hazard":
-            chosen_action = hazard.predict_action(
-                case,
-                elapsed_seconds=case.observed_delay_seconds,
-            )
+            predicted_delay = hazard.predict_median_delay_seconds(case)
         else:
-            chosen_action = baseline.predict_action(
-                case,
-                elapsed_seconds=case.observed_delay_seconds,
-            )
+            predicted_delay = baseline.predict_delay_seconds(case)
 
-        if chosen_action == Action.WAIT:
-            temporal_wait_misses += 1
-            continue
+        if predicted_delay < case.delay_lower_seconds:
+            temporal_early_predictions += 1
+        elif predicted_delay > case.delay_upper_seconds:
+            temporal_late_predictions += 1
 
+        # Content quality is evaluated independently from timing quality. The
+        # held-out real event tells us that a message eventually existed, while
+        # REPLY vs INITIATE is inferable from visible context. Skipping language
+        # evaluation because a coarse timestamp made the timing model say WAIT
+        # would conflate two different subsystems.
+        chosen_action = _candidate_action(case)
         packet = build_generation_context(
             case,
             evidence,
@@ -155,7 +170,9 @@ def run_nvidia_replay(
         candidate_test_cases=len(test_cases),
         requested_cases=len(requested),
         generated_cases=generated_cases,
-        temporal_wait_misses=temporal_wait_misses,
+        temporal_wait_misses=temporal_late_predictions,
+        temporal_early_predictions=temporal_early_predictions,
+        temporal_late_predictions=temporal_late_predictions,
         mean_burst_size_absolute_error=_mean(burst_errors),
         mean_total_char_length_absolute_error=_mean(length_errors),
         mean_char_bigram_f1=_mean(bigram_scores),
