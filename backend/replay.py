@@ -25,6 +25,12 @@ class ReplayCase:
     burst. ``target_burst`` is the held-out real continuation. Timing is kept as
     an interval because KakaoTalk exports are usually minute-precision while
     Instagram timestamps are much finer.
+
+    ``action`` is the best observable REPLY/INITIATE proxy from adjacent sender
+    order. When a session restarts after a long gap, sender order alone cannot
+    distinguish a late reply from a genuinely new initiation, so
+    ``action_is_ambiguous`` is set and the positive action label is excluded from
+    action-class evaluation. WAIT timing before the event remains usable.
     """
 
     case_id: str
@@ -43,6 +49,7 @@ class ReplayCase:
     target_burst: tuple[EvidenceMessage, ...]
     burst_size: int
     session_restart: bool
+    action_is_ambiguous: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -50,7 +57,7 @@ class ActionSnapshot:
     """A point-in-time action label derived from a ReplayCase.
 
     WAIT snapshots are sampled before the real event. The final snapshot occurs
-    at the observed event timestamp and is labelled REPLY or INITIATE.
+    at the observed event timestamp only when REPLY/INITIATE is not ambiguous.
     """
 
     case_id: str
@@ -72,6 +79,9 @@ class ReplayAudit:
     event_count: int
     reply_count: int
     initiate_count: int
+    confident_reply_count: int
+    confident_initiate_count: int
+    ambiguous_action_count: int
     median_observed_delay_seconds: float | None
     median_burst_size: float | None
     snapshot_count: int
@@ -161,10 +171,12 @@ def build_replay_cases(
     Group conversations remain useful persona evidence but are not reliable
     labels for whether the target was responding to *the user*.
 
-    REPLY means the immediately preceding observed message was sent by the
-    explicit ``self_person_id``. INITIATE includes spontaneous follow-ups after
-    the target's own prior message. Events with an unresolved preceding sender
-    are skipped rather than guessed.
+    For events inside one active session, REPLY means the immediately preceding
+    observed message was sent by ``self_person_id`` and INITIATE is the coarse
+    follow-up proxy when the target sends again after its own previous burst.
+    After a long session gap, adjacent sender order is not enough to distinguish
+    late reply from genuinely new initiation. Those cases are retained for
+    timing/content replay but marked ``action_is_ambiguous``.
     """
 
     if context_size < 1:
@@ -227,6 +239,7 @@ def build_replay_cases(
                 continue
 
             observed, lower, upper = _delay_interval(previous, current)
+            session_restart = observed > session_gap_seconds
             context_start = max(0, index - context_size)
             burst = tuple(messages[index:burst_end])
             cases.append(
@@ -251,7 +264,8 @@ def build_replay_cases(
                     context=tuple(messages[context_start:index]),
                     target_burst=burst,
                     burst_size=len(burst),
-                    session_restart=observed > session_gap_seconds,
+                    session_restart=session_restart,
+                    action_is_ambiguous=session_restart,
                 )
             )
             index = burst_end
@@ -287,7 +301,11 @@ def build_action_snapshots(
     ),
     max_wait_snapshots_per_case: int = 4,
 ) -> list[ActionSnapshot]:
-    """Materialize WAIT negatives plus the real positive action snapshot."""
+    """Materialize safe WAIT negatives plus trustworthy positive labels.
+
+    Long-gap cases still contribute WAIT observations before the event, but the
+    final REPLY/INITIATE snapshot is omitted when the action role is ambiguous.
+    """
 
     normalized_offsets = sorted(
         {float(value) for value in wait_offsets_seconds if float(value) > 0}
@@ -312,15 +330,16 @@ def build_action_snapshots(
                     ),
                 )
             )
-        snapshots.append(
-            ActionSnapshot(
-                case_id=case.case_id,
-                observed_at=case.action_at,
-                expected_action=case.action,
-                elapsed_seconds=case.observed_delay_seconds,
-                remaining_observed_seconds=0.0,
+        if not case.action_is_ambiguous:
+            snapshots.append(
+                ActionSnapshot(
+                    case_id=case.case_id,
+                    observed_at=case.action_at,
+                    expected_action=case.action,
+                    elapsed_seconds=case.observed_delay_seconds,
+                    remaining_observed_seconds=0.0,
+                )
             )
-        )
 
     snapshots.sort(key=lambda item: (item.observed_at, item.case_id))
     return snapshots
@@ -367,6 +386,15 @@ def audit_replay(
         event_count=len(cases),
         reply_count=sum(case.action == Action.REPLY for case in cases),
         initiate_count=sum(case.action == Action.INITIATE for case in cases),
+        confident_reply_count=sum(
+            case.action == Action.REPLY and not case.action_is_ambiguous
+            for case in cases
+        ),
+        confident_initiate_count=sum(
+            case.action == Action.INITIATE and not case.action_is_ambiguous
+            for case in cases
+        ),
+        ambiguous_action_count=sum(case.action_is_ambiguous for case in cases),
         median_observed_delay_seconds=(
             float(statistics.median(delays)) if delays else None
         ),
