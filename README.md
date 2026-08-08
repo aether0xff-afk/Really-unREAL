@@ -17,18 +17,21 @@ The project does **not** claim to reproduce a real person's hidden thoughts or f
 - **Source-aware.** KakaoTalk, Instagram DMs, and social activity remain distinguishable so one context does not silently overwrite another.
 - **Kakao-primary.** KakaoTalk is the primary source for persona and temporal behavior. Instagram is supplemental evidence used to fill gaps and add cross-platform context, not to override stable Kakao-derived behavior.
 - **Conservative identity resolution.** Fuzzy name similarity may suggest a match, but never silently merges two real people.
+- **Replay before vibes.** New modeling choices must improve held-out historical behavior, not merely produce subjectively convincing chat samples.
 
-## Phase 1 / 1.5 — implemented scaffold
+## Implemented pipeline
 
 The current pipeline can:
 
 1. Parse KakaoTalk text exports and ZIP bundles.
 2. Parse Meta/Instagram information-download ZIPs, including DMs and activity counts.
-3. Normalize messages into a stable schema with source metadata.
+3. Normalize messages into a stable schema with source metadata and timestamp precision.
 4. Extract language/style and temporal statistics.
 5. Suggest cross-platform identity candidates without auto-merging ambiguous names.
 6. Fuse approved aliases into stable local person IDs while preserving source/context relevance.
-7. Expose local audit tools without committing private source data.
+7. Build leakage-safe Historical Replay events with `WAIT / REPLY / INITIATE`, timing intervals, and message bursts.
+8. Split replay chronologically into train / validation / test.
+9. Expose local audit tools without committing private source data.
 
 KakaoTalk text analysis:
 
@@ -60,6 +63,16 @@ python -m backend.fusion_audit \
   person-001
 ```
 
+Build/audit Historical Replay for the same person:
+
+```bash
+python -m backend.replay_audit \
+  ./data/raw/kakao_bundle.zip \
+  ./data/raw/instagram_export.zip \
+  ./identity.local.json \
+  person-001
+```
+
 Run tests with:
 
 ```bash
@@ -83,6 +96,29 @@ These are starting relevance weights, not calibrated probabilities and not relat
 
 The system should never turn follows, likes, or engagement into claims about hidden feelings toward a person.
 
+## Historical Replay
+
+Replay hides a real continuation and asks the future simulator to reproduce observable behavior rather than an exact string.
+
+```text
+visible past
+    |
+    +---- observation time
+    |          |
+    |        WAIT?
+    |          |
+    +----------+---- real event
+                      |
+                      +---- REPLY / INITIATE
+                      +---- timing interval
+                      +---- message burst
+                      +---- held-out content
+```
+
+KakaoTalk minute timestamps are treated as interval-censored rather than fake second-level truth. Direct conversations are the default action/timing benchmark; group messages remain useful supporting persona evidence but are excluded from behavioral labels unless explicitly requested.
+
+See `docs/HISTORICAL_REPLAY.md` for the evaluation contract.
+
 ## Architecture
 
 ```text
@@ -102,6 +138,8 @@ Kakao / Instagram / other records
               |
               +------> temporal profile
               |
+              +------> Historical Replay
+              |
               +------> contextual / interest evidence
                               |
 real clock ------------------+----> action policy: WAIT / REPLY / INITIATE
@@ -120,10 +158,13 @@ The temporal/action layer sits **above** the language model. The model should no
 
 ## Roadmap
 
-- **Phase 1:** parsing + observable profiles
-- **Phase 1.5:** source fusion and per-person identity resolution
-- **Phase 2:** historical replay (hide the real continuation and predict action/timing)
+- **Phase 1:** parsing + observable profiles — scaffold implemented
+- **Phase 1.5:** source fusion and per-person identity resolution — scaffold implemented
+- **Phase 2A:** Historical Replay dataset/labels/splits — implemented
+- **Phase 2B:** empirical/survival temporal baseline — next
+- **Phase 2C:** cutoff-safe RAG + persona language generation
+- **Phase 2D:** Kakao-only vs Kakao+Instagram ablation
 - **Phase 3:** shadow simulation against a past time interval
 - **Phase 4:** live real-time simulation with spontaneous initiation and long-term memory
 
-See `docs/IDENTITY_AND_FUSION.md` and the other documents in `docs/` for the detailed design and evaluation plan.
+See `docs/IDENTITY_AND_FUSION.md`, `docs/HISTORICAL_REPLAY.md`, and the other documents in `docs/` for the detailed design and evaluation plan.
