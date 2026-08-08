@@ -1,1 +1,5 @@
-"""Really-unREAL backend package."""
+"""Really-unREAL conversation-behavior simulation core."""
+
+__version__ = "1.0.0"
+
+__all__ = ["__version__"]
