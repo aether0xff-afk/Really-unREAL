@@ -14,6 +14,7 @@ def _message(
     *,
     platform: str = "kakao",
     weight: float = 1.0,
+    conversation_id: str | None = None,
 ) -> EvidenceMessage:
     context = (
         EvidenceContext.KAKAO_DIRECT
@@ -23,7 +24,7 @@ def _message(
     return EvidenceMessage(
         message=ChatMessage(at, "target", text),
         platform=platform,
-        conversation_id=platform,
+        conversation_id=conversation_id or platform,
         context=context,
         sender_person_id="target",
         evidence_weight=weight,
@@ -34,11 +35,11 @@ def _evidence(messages: tuple[EvidenceMessage, ...]) -> PersonEvidence:
     conversations = tuple(
         EvidenceConversation(
             platform=message.platform,
-            conversation_id=f"c-{index}",
+            conversation_id=message.conversation_id,
             context=message.context,
             messages=(message,),
         )
-        for index, message in enumerate(messages)
+        for message in messages
     )
     return PersonEvidence(person_id="target", conversations=conversations)
 
@@ -83,3 +84,31 @@ def test_instagram_is_supplemental_in_weighted_language_profile() -> None:
 
     assert profile.effective_message_weight == 1.55
     assert profile.weighted_mean_char_length < unweighted_mean
+
+
+def test_current_relationship_can_shift_self_twin_style_without_erasing_global_fallback() -> None:
+    focused = _message(
+        BASE - timedelta(days=2),
+        "ㅇㅇ",
+        conversation_id="friend-a",
+    )
+    global_other = _message(
+        BASE - timedelta(days=1),
+        "이쪽 대화에서는 문장을 꽤 길게 작성하는 편임",
+        conversation_id="friend-b",
+    )
+    evidence = _evidence((focused, global_other))
+
+    global_profile = build_cutoff_language_profile(evidence, BASE)
+    focused_profile = build_cutoff_language_profile(
+        evidence,
+        BASE,
+        focus_conversation_id="friend-a",
+        focus_platform="kakao",
+        focus_weight_multiplier=4.0,
+    )
+
+    assert focused_profile.profile_scope == "relationship_blend"
+    assert focused_profile.focused_message_count == 1
+    assert focused_profile.message_count == 2
+    assert focused_profile.weighted_mean_char_length < global_profile.weighted_mean_char_length
