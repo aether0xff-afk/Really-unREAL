@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Protocol
@@ -7,6 +8,7 @@ from typing import Protocol
 from backend.fusion import EvidenceMessage, PersonEvidence
 from backend.generation import BurstLanguageModel, GeneratedBurst
 from backend.generation_context import build_generation_context
+from backend.models import ChatMessage, MemorySource
 from backend.replay import ReplayCase
 from backend.replay_baseline import EmpiricalTimingBaseline
 from backend.retrieval import CutoffExampleIndex
@@ -21,6 +23,8 @@ class TimingSampler(Protocol):
         platform: str,
         conversation_id: str,
         action: Action,
+        observed_at: datetime | None = None,
+        visible_context: Sequence[EvidenceMessage] = (),
     ) -> float | None: ...
 
 
@@ -91,20 +95,7 @@ def _direct_contexts(platform: str):
 
 
 class LiveSimulationEngine:
-    """One-conversation discrete-event runtime.
-
-    Incoming real messages are external observations. The engine persists only
-    future action times. Text generation occurs at dispatch time, so WAIT remains
-    a real outcome and closing/reopening the app does not collapse elapsed time.
-
-    The deterministic timing baseline remains available as a fallback and for
-    evaluation. Live desktop sessions may additionally provide a ``TimingSampler``
-    so each future event is drawn from historically observed timing variability
-    instead of reusing one median delay forever.
-
-    The runtime never sends to a real platform. ``process_due`` returns simulated
-    emissions to the caller/UI and stores them as SIMULATION memory only.
-    """
+    """One-conversation discrete-event runtime with context-aware timing."""
 
     def __init__(
         self,
@@ -131,12 +122,20 @@ class LiveSimulationEngine:
         self.language_model = language_model
         self.store = store
 
-    def _next_delay(self, action: Action) -> float | None:
+    def _next_delay(
+        self,
+        action: Action,
+        *,
+        observed_at: datetime,
+        visible_context: Sequence[EvidenceMessage] = (),
+    ) -> float | None:
         if self.timing_sampler is not None:
             sampled = self.timing_sampler.sample_delay_seconds(
                 platform=self.platform,
                 conversation_id=self.conversation_id,
                 action=action,
+                observed_at=observed_at,
+                visible_context=visible_context,
             )
             if sampled is not None:
                 return max(0.0, float(sampled))
@@ -147,14 +146,23 @@ class LiveSimulationEngine:
             action=action,
         )
 
-    def observe_counterpart_message(self, *, observed_at: datetime) -> ScheduledEvent:
+    def observe_counterpart_message(
+        self,
+        *,
+        observed_at: datetime,
+        visible_context: Sequence[EvidenceMessage] = (),
+    ) -> ScheduledEvent:
         self.store.cancel_pending(
             twin_person_id=self.twin_person_id,
             platform=self.platform,
             conversation_id=self.conversation_id,
             action=Action.INITIATE,
         )
-        delay = self._next_delay(Action.REPLY)
+        delay = self._next_delay(
+            Action.REPLY,
+            observed_at=observed_at,
+            visible_context=visible_context,
+        )
         if delay is None:
             raise RuntimeError("reply timing is unavailable")
         return self.store.schedule(
@@ -166,8 +174,17 @@ class LiveSimulationEngine:
             created_at=observed_at,
         )
 
-    def schedule_idle_initiation(self, *, after: datetime) -> ScheduledEvent | None:
-        delay = self._next_delay(Action.INITIATE)
+    def schedule_idle_initiation(
+        self,
+        *,
+        after: datetime,
+        visible_context: Sequence[EvidenceMessage] = (),
+    ) -> ScheduledEvent | None:
+        delay = self._next_delay(
+            Action.INITIATE,
+            observed_at=after,
+            visible_context=visible_context,
+        )
         if delay is None:
             return None
         return self.store.schedule(
@@ -178,6 +195,34 @@ class LiveSimulationEngine:
             due_at=after + timedelta(seconds=delay),
             created_at=after,
         )
+
+    def _post_generation_context(
+        self,
+        event_context: tuple[EvidenceMessage, ...],
+        timestamped: tuple[tuple[datetime, str], ...],
+    ) -> tuple[EvidenceMessage, ...]:
+        evidence_context = (
+            event_context[-1].context
+            if event_context
+            else next(iter(_direct_contexts(self.platform)))
+        )
+        generated = tuple(
+            EvidenceMessage(
+                message=ChatMessage(
+                    timestamp=timestamp,
+                    sender=self.twin_person_id,
+                    text=text,
+                    source=MemorySource.SIMULATION,
+                ),
+                platform=self.platform,
+                conversation_id=self.conversation_id,
+                context=evidence_context,
+                sender_person_id=self.twin_person_id,
+                evidence_weight=1.0,
+            )
+            for timestamp, text in timestamped
+        )
+        return event_context + generated
 
     def process_due(
         self,
@@ -194,12 +239,8 @@ class LiveSimulationEngine:
             ):
                 continue
 
-            # Recovery may happen long after the event became due. Never let an
-            # overdue event see real messages that arrived after its own due time.
             event_context = tuple(
-                item
-                for item in visible_context
-                if item.message.timestamp <= event.due_at
+                item for item in visible_context if item.message.timestamp <= event.due_at
             )
             case = _generation_case(
                 twin_person_id=self.twin_person_id,
@@ -240,7 +281,11 @@ class LiveSimulationEngine:
                 )
             )
             if event.action == Action.REPLY:
-                self.schedule_idle_initiation(after=event.due_at)
+                post_context = self._post_generation_context(event_context, timestamped)
+                self.schedule_idle_initiation(
+                    after=timestamped[-1][0] if timestamped else event.due_at,
+                    visible_context=post_context,
+                )
 
         self.store.set_last_processed(now)
         return emissions
