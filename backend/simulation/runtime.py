@@ -109,9 +109,12 @@ class LiveSimulationEngine:
         language_model: BurstLanguageModel,
         store: SQLiteSimulationStore,
         timing_sampler: TimingSampler | None = None,
+        raw_response_examples: int = 0,
     ) -> None:
         if evidence.person_id != twin_person_id:
             raise ValueError("evidence and twin_person_id must match")
+        if raw_response_examples < 0:
+            raise ValueError("raw_response_examples must be >= 0")
         self.twin_person_id = twin_person_id
         self.platform = platform
         self.conversation_id = conversation_id
@@ -121,6 +124,7 @@ class LiveSimulationEngine:
         self.timing_sampler = timing_sampler
         self.language_model = language_model
         self.store = store
+        self.raw_response_examples = int(raw_response_examples)
 
     def _next_delay(
         self,
@@ -256,6 +260,7 @@ class LiveSimulationEngine:
                 self.retrieval_index,
                 chosen_action=event.action,
                 action_specific_retrieval=True,
+                raw_response_examples=self.raw_response_examples,
             )
             burst = self.language_model.generate_burst(packet)
             timestamped = tuple(
