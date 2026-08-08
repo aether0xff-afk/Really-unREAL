@@ -5,7 +5,7 @@ v1.0.1 adds a small local desktop UI so the first useful run does not require ed
 ## Windows portable build
 
 1. Download the `Really-unREAL-v1.0.1-Windows-x64` build artifact or release ZIP.
-2. Extract the ZIP.
+2. Extract the ZIP. It contains `Really-unREAL.exe` and this quick-start guide; no Python installation is required for the portable executable.
 3. Run `Really-unREAL.exe`.
 4. Windows SmartScreen may warn about an unsigned community build. Check that the file came from this repository's GitHub Actions/Release before choosing to run it.
 
