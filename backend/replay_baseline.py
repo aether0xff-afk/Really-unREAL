@@ -5,7 +5,10 @@ from dataclasses import asdict, dataclass
 from typing import Iterable, Sequence
 
 from backend.replay import ActionSnapshot, ReplayCase
-from backend.simulation.action_policy import Action
+from backend.simulation.action_policy import Action, MESSAGE_ACTIONS
+
+
+_SESSION_GAP_SECONDS = 6.0 * 3600.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -15,6 +18,7 @@ class ReplayBaselineMetrics:
     balanced_accuracy: float
     wait_recall: float | None
     reply_recall: float | None
+    follow_up_recall: float | None
     initiate_recall: float | None
     mean_interval_error_seconds: float | None
     median_interval_error_seconds: float | None
@@ -34,8 +38,7 @@ def _weighted_quantile(
         raise ValueError("q must be between 0 and 1")
 
     ordered = sorted(
-        (float(value), max(0.0, float(weight)))
-        for value, weight in values_and_weights
+        (float(value), max(0.0, float(weight))) for value, weight in values_and_weights
     )
     total_weight = sum(weight for _, weight in ordered)
     if total_weight <= 0:
@@ -51,26 +54,26 @@ def _weighted_quantile(
     return ordered[-1][0]
 
 
-def _observable_candidate_action(case: ReplayCase) -> Action:
-    """Infer the coarse action type from visible context, not held-out text."""
+def _observable_candidate_action(
+    case: ReplayCase,
+    *,
+    elapsed_seconds: float = 0.0,
+) -> Action:
+    """Infer an action role using only visible sender order and elapsed silence."""
 
     if not case.context:
         raise ValueError("ReplayCase has no visible context")
     previous_sender = case.context[-1].sender_person_id
     if previous_sender == case.person_id:
-        return Action.INITIATE
+        return (
+            Action.INITIATE
+            if elapsed_seconds > _SESSION_GAP_SECONDS
+            else Action.FOLLOW_UP
+        )
     return Action.REPLY
 
 
 def _representative_training_delay_seconds(case: ReplayCase) -> float:
-    """Use the center of the observed timing interval for empirical fitting.
-
-    KakaoTalk timestamps are minute-precision. Treating a same-minute reply as
-    literal 0 seconds makes the empirical model learn an artificial immediate-
-    reply spike. The interval midpoint is a simple non-parametric representative
-    for this floor baseline; interval-aware evaluation still uses the full range.
-    """
-
     return (case.delay_lower_seconds + case.delay_upper_seconds) / 2.0
 
 
@@ -83,18 +86,7 @@ def _interval_error_seconds(prediction: float, case: ReplayCase) -> float:
 
 
 class EmpiricalTimingBaseline:
-    """Weighted empirical timing baseline with conservative backoff.
-
-    Timing is conditioned, when enough data exists, on the current direct
-    relationship before backing off to platform/action and then global timing.
-    This matters for SELF_TWIN because one person may answer different friends at
-    very different speeds.
-
-    Coarse timestamp observations are fitted with the center of their feasible
-    delay interval rather than a fake exact timestamp. Long-gap events whose
-    REPLY-vs-INITIATE role is ambiguous remain in the global timing distribution
-    but are excluded from action-conditioned buckets.
-    """
+    """Weighted empirical timing floor with relationship/action backoff."""
 
     def __init__(
         self,
@@ -137,38 +129,38 @@ class EmpiricalTimingBaseline:
             for case in cases
         ]
         global_threshold = _weighted_quantile(global_samples, quantile)
-
         confident_cases = [case for case in cases if not case.action_is_ambiguous]
 
         action_thresholds: dict[Action, float] = {}
-        for action in (Action.REPLY, Action.INITIATE):
+        for action in MESSAGE_ACTIONS:
             bucket = [
                 (_representative_training_delay_seconds(case), case.evidence_weight)
                 for case in confident_cases
-                if _observable_candidate_action(case) == action
+                if case.action == action
             ]
             if bucket:
                 action_thresholds[action] = _weighted_quantile(bucket, quantile)
 
-        platform_thresholds: dict[tuple[str, Action], float] = {}
         platform_buckets: dict[tuple[str, Action], list[tuple[float, float]]] = {}
-        conversation_thresholds: dict[tuple[str, Action], float] = {}
         conversation_buckets: dict[tuple[str, Action], list[tuple[float, float]]] = {}
         for case in confident_cases:
-            action = _observable_candidate_action(case)
-            sample = (
-                _representative_training_delay_seconds(case),
-                case.evidence_weight,
-            )
+            action = case.action
+            if action not in MESSAGE_ACTIONS:
+                continue
+            sample = (_representative_training_delay_seconds(case), case.evidence_weight)
             platform_buckets.setdefault((case.platform, action), []).append(sample)
             conversation_buckets.setdefault((case.conversation_id, action), []).append(sample)
 
-        for key, bucket in platform_buckets.items():
-            if len(bucket) >= minimum_bucket_events:
-                platform_thresholds[key] = _weighted_quantile(bucket, quantile)
-        for key, bucket in conversation_buckets.items():
-            if len(bucket) >= minimum_conversation_events:
-                conversation_thresholds[key] = _weighted_quantile(bucket, quantile)
+        platform_thresholds = {
+            key: _weighted_quantile(bucket, quantile)
+            for key, bucket in platform_buckets.items()
+            if len(bucket) >= minimum_bucket_events
+        }
+        conversation_thresholds = {
+            key: _weighted_quantile(bucket, quantile)
+            for key, bucket in conversation_buckets.items()
+            if len(bucket) >= minimum_conversation_events
+        }
 
         return cls(
             quantile=quantile,
@@ -180,19 +172,41 @@ class EmpiricalTimingBaseline:
             global_threshold=global_threshold,
         )
 
-    def predict_delay_seconds(self, case: ReplayCase) -> float:
-        action = _observable_candidate_action(case)
+    def delay_for_action(
+        self,
+        *,
+        conversation_id: str,
+        platform: str,
+        action: Action,
+    ) -> float | None:
+        if action not in MESSAGE_ACTIONS:
+            return None
         return self.conversation_thresholds.get(
-            (case.conversation_id, action),
+            (conversation_id, action),
             self.platform_thresholds.get(
-                (case.platform, action),
-                self.action_thresholds.get(action, self.global_threshold),
+                (platform, action),
+                self.action_thresholds.get(action),
             ),
         )
 
+    def predict_delay_seconds(self, case: ReplayCase) -> float:
+        action = _observable_candidate_action(case)
+        prediction = self.delay_for_action(
+            conversation_id=case.conversation_id,
+            platform=case.platform,
+            action=action,
+        )
+        return self.global_threshold if prediction is None else prediction
+
     def predict_action(self, case: ReplayCase, *, elapsed_seconds: float) -> Action:
-        candidate = _observable_candidate_action(case)
-        threshold = self.predict_delay_seconds(case)
+        candidate = _observable_candidate_action(case, elapsed_seconds=elapsed_seconds)
+        threshold = self.delay_for_action(
+            conversation_id=case.conversation_id,
+            platform=case.platform,
+            action=candidate,
+        )
+        if threshold is None:
+            return Action.WAIT
         return candidate if elapsed_seconds >= threshold else Action.WAIT
 
     def thresholds_dict(self) -> dict[str, object]:
@@ -202,8 +216,7 @@ class EmpiricalTimingBaseline:
             "minimum_conversation_events": self.minimum_conversation_events,
             "global_seconds": self.global_threshold,
             "by_action_seconds": {
-                action.value: value
-                for action, value in self.action_thresholds.items()
+                action.value: value for action, value in self.action_thresholds.items()
             },
             "by_platform_action_seconds": {
                 f"{platform}:{action.value}": value
@@ -230,13 +243,8 @@ def evaluate_empirical_baseline(
     for snapshot in snapshots:
         case = by_id.get(snapshot.case_id)
         if case is None:
-            raise ValueError(
-                f"snapshot references unknown replay case {snapshot.case_id!r}"
-            )
-        predicted = baseline.predict_action(
-            case,
-            elapsed_seconds=snapshot.elapsed_seconds,
-        )
+            raise ValueError(f"snapshot references unknown replay case {snapshot.case_id!r}")
+        predicted = baseline.predict_action(case, elapsed_seconds=snapshot.elapsed_seconds)
         actual = snapshot.expected_action
         confusion[actual.value][predicted.value] += 1
         correct += predicted == actual
@@ -258,12 +266,11 @@ def evaluate_empirical_baseline(
     ordered_errors = sorted(interval_errors)
     if ordered_errors:
         middle = len(ordered_errors) // 2
-        if len(ordered_errors) % 2:
-            median_error = ordered_errors[middle]
-        else:
-            median_error = (
-                ordered_errors[middle - 1] + ordered_errors[middle]
-            ) / 2
+        median_error = (
+            ordered_errors[middle]
+            if len(ordered_errors) % 2
+            else (ordered_errors[middle - 1] + ordered_errors[middle]) / 2
+        )
         mean_error = sum(ordered_errors) / len(ordered_errors)
     else:
         median_error = None
@@ -279,15 +286,11 @@ def evaluate_empirical_baseline(
         ),
         wait_recall=recalls[Action.WAIT],
         reply_recall=recalls[Action.REPLY],
+        follow_up_recall=recalls[Action.FOLLOW_UP],
         initiate_recall=recalls[Action.INITIATE],
-        mean_interval_error_seconds=(
-            round(mean_error, 3) if mean_error is not None else None
-        ),
+        mean_interval_error_seconds=(round(mean_error, 3) if mean_error is not None else None),
         median_interval_error_seconds=(
             round(median_error, 3) if median_error is not None else None
         ),
-        confusion={
-            actual: dict(predictions)
-            for actual, predictions in confusion.items()
-        },
+        confusion={actual: dict(predictions) for actual, predictions in confusion.items()},
     )
