@@ -96,6 +96,36 @@ def test_builds_reply_and_initiate_proxies_without_future_leakage() -> None:
     )
 
 
+def test_direct_replay_can_target_self_for_self_twin() -> None:
+    messages = (
+        _evidence(0, "친구", "friend", "뭐함"),
+        _evidence(2, "나", "self", "집"),
+        _evidence(10, "친구", "friend", "과제 함?"),
+        _evidence(12, "나", "self", "ㄴㄴ"),
+        _evidence(20, "나", "self", "근데 낼 몇시감"),
+    )
+    evidence = PersonEvidence(
+        person_id="self",
+        conversations=(
+            EvidenceConversation(
+                platform="kakao",
+                conversation_id="direct-1",
+                context=EvidenceContext.KAKAO_DIRECT,
+                messages=messages,
+            ),
+        ),
+    )
+
+    cases = build_replay_cases(evidence, self_person_id="self")
+
+    assert [case.action for case in cases] == [
+        Action.REPLY,
+        Action.REPLY,
+        Action.INITIATE,
+    ]
+    assert all(case.person_id == "self" for case in cases)
+
+
 def test_kakao_delay_is_interval_censored_instead_of_fake_second_precision() -> None:
     case = build_replay_cases(
         _direct_evidence(),
