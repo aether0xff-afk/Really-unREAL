@@ -98,7 +98,8 @@ Python 3.11+ is required.
 ```bash
 python -m pip install -e '.[dev,build]'
 pytest -q
-pyinstaller --noconfirm --clean --onefile --windowed --name Really-unREAL backend/gui.py
+pyinstaller --noconfirm --clean --onefile --windowed --name Really-unREAL backend/gui_entry.py
+./dist/Really-unREAL.exe --smoke
 ```
 
-The executable is written to `dist/Really-unREAL.exe` on Windows.
+The executable is written to `dist/Really-unREAL.exe` on Windows. The official workflow also executes the bundled `--smoke` path before packaging, which verifies that timezone data and the replay modules survived bundling.
