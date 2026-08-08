@@ -16,6 +16,10 @@ def bundle_smoke() -> None:
     import backend.gui_live  # noqa: F401
     import backend.gui_chat_window  # noqa: F401
     import backend.gui_responsive  # noqa: F401
+    import backend.live_timing  # noqa: F401
+    import backend.generation_guard  # noqa: F401
+    import backend.persona.style_fingerprint  # noqa: F401
+    import backend.providers.errors  # noqa: F401
     import backend.ingest.instagram  # noqa: F401
     import backend.replay_generation  # noqa: F401
 
