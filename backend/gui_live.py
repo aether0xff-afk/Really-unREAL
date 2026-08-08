@@ -6,6 +6,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 from backend.fusion import EvidenceContext, EvidenceMessage
+from backend.generation_guard import GuardedBurstLanguageModel
 from backend.gui_runtime import (
     NVIDIA_GUI_FORMAT_ATTEMPTS,
     NVIDIA_GUI_MAX_ATTEMPTS,
@@ -117,11 +118,17 @@ class LiveChatSession:
         timing = EmpiricalTimingBaseline.fit(cases)
         timing_sampler = ContextualLiveTimingSampler(cases, person_id=target_id)
         index = CutoffExampleIndex.from_replay_cases(cases)
-        language_model = _language_model(
+        base_language_model = _language_model(
             provider=provider,
             model=model,
             base_url=base_url,
             api_key=api_key,
+        )
+        language_model = GuardedBurstLanguageModel(
+            base_language_model,
+            max_attempts=2,
+            copy_threshold=0.82,
+            min_reference_chars=8,
         )
         store = SQLiteSimulationStore(store_path or default_live_store_path())
 
@@ -143,6 +150,9 @@ class LiveChatSession:
             timing_sampler=timing_sampler,
             language_model=language_model,
             store=store,
+            # Two old REAL replies are enough to expose person-specific rhythm
+            # without turning the prompt into a transcript or retrieval copy path.
+            raw_response_examples=2,
         )
 
     @property

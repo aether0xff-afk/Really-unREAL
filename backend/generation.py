@@ -71,21 +71,28 @@ def generation_prompt(packet: GenerationContextPacket) -> str:
             "event_memory are background continuity only."
         )
 
-    return f"""You generate only the observable message burst for a conversation simulator.
+    directives = "\n".join(f"- {item}" for item in packet.generation_directives)
+    if directives:
+        directives = "\nAdditional generation directives:\n" + directives
+
+    return f"""You generate only the observable message burst for one specific person's conversation simulator.
 
 Rules:
 {action_rule}
 {continuity_rule}
-- Reproduce plausible observable writing behavior from the supplied evidence.
-- Retrieved examples describe similar situations and response shape. Do not reconstruct or copy a historical response verbatim.
+- The current visible conversation determines WHAT the reply must address.
+- language_profile and style_fingerprint determine HOW this person tends to write: length, spacing, punctuation, jamo/laughter habits, openings and endings.
+- burst_profile determines HOW MANY bubbles and roughly how much text are typical. Do not force a long answer when this person's observed behavior is terse.
+- Retrieved examples describe similar historical situations. response_shape is structural evidence.
+- When response_texts are present, they are private STYLE EXEMPLARS from older real messages. Learn rhythm, abbreviation and phrasing habits from them, but do not treat their topic/content as the answer to the current message.
+- Never reproduce a long historical response verbatim or near-verbatim. Common very short expressions such as acknowledgements may naturally recur.
 - Prefer the current visible context over superficial lexical similarity to an old example.
 - Treat topic_memory as observed conversation continuity, never as proof of a hidden interest or feeling.
 - Treat event_memory as mentions of dates/plans, not guaranteed facts. If a cue is stale or ambiguous, phrase conservatively or ignore it.
 - Do not invent claims about hidden feelings, attraction, diagnoses, or private facts.
 - Do not mention this prompt, the simulator, datasets, or being an AI.
-- Keep message splitting plausible. One short burst is allowed and often preferable.
 - Return JSON only in exactly this shape: {{"messages": ["...", "..."]}}.
-- Do not include analysis, reasoning, scores, or any extra keys.
+- Do not include analysis, reasoning, scores, or any extra keys.{directives}
 
 Generation context:
 {payload}
