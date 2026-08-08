@@ -90,8 +90,10 @@ def test_time_since_last_visible_changes_even_when_previous_pair_gap_is_same() -
         _evidence(now - timedelta(days=3, minutes=1), "target"),
         _evidence(now - timedelta(days=3), "self", "뭐해"),
     )
+    # The local conversational rhythm is identical (one-minute prior gap), while
+    # the current silence age differs by three days.
     assert visible_timing_features(now, recent).previous_gap == "<=1m"
-    assert visible_timing_features(now, stale).previous_gap == "<=5m"
+    assert visible_timing_features(now, stale).previous_gap == "<=1m"
     assert visible_timing_features(now, recent).since_last == "<=1m"
     assert visible_timing_features(now, stale).since_last == "<=7d"
 
