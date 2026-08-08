@@ -58,9 +58,6 @@ def _generation_case(
         evidence_context=(context[-1].context if context else next(iter(_direct_contexts(platform)))),
         evidence_weight=1.0,
         action=action,
-        # In live/shadow mode generation happens at due_at. This cutoff lets the
-        # packet use every observable fact that existed by decision time while
-        # still keeping future evidence out.
         observation_end=due_at,
         action_at=due_at,
         observed_delay_seconds=max(0.0, (due_at - previous_at).total_seconds()),
@@ -172,13 +169,21 @@ class LiveSimulationEngine:
                 or event.conversation_id != self.conversation_id
             ):
                 continue
+
+            # Recovery may happen long after the event became due. Never let an
+            # overdue event see real messages that arrived after its own due time.
+            event_context = tuple(
+                item
+                for item in visible_context
+                if item.message.timestamp <= event.due_at
+            )
             case = _generation_case(
                 twin_person_id=self.twin_person_id,
                 platform=self.platform,
                 conversation_id=self.conversation_id,
                 action=event.action,
                 due_at=event.due_at,
-                context=visible_context,
+                context=event_context,
             )
             packet = build_generation_context(
                 case,
