@@ -1,6 +1,7 @@
 from backend.generation_context import (
     GenerationContextPacket,
     RetrievedGenerationExample,
+    RetrievedResponseShape,
     VisibleGenerationMessage,
 )
 from backend.persona.cutoff import CutoffLanguageProfile
@@ -37,9 +38,15 @@ def _packet() -> GenerationContextPacket:
                 platform="kakao",
                 action="REPLY",
                 context_texts=("뭐해",),
-                response_texts=("집ㅋㅋ",),
                 burst_size=1,
                 retrieval_score=0.8,
+                response_shape=RetrievedResponseShape(
+                    message_lengths=(3,),
+                    question_count=0,
+                    laugh_expression_count=1,
+                    cry_expression_count=0,
+                    endings=("ㅋㅋ",),
+                ),
             ),
         ),
     )
@@ -74,6 +81,7 @@ def test_nvidia_adapter_uses_bearer_key_and_parses_json() -> None:
     assert captured["payload"]["model"] == "nvidia/nemotron-3-ultra-550b-a55b"
     assert captured["payload"]["chat_template_kwargs"]["enable_thinking"] is False
     assert "secret-test-key" not in captured["payload"]["messages"][0]["content"]
+    assert "집ㅋㅋ" not in captured["payload"]["messages"][0]["content"]
 
 
 def test_nvidia_adapter_requires_api_key(monkeypatch) -> None:
