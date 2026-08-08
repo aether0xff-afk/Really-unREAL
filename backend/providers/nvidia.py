@@ -10,6 +10,7 @@ from typing import Any
 
 from backend.generation import GeneratedBurst, generation_prompt
 from backend.generation_context import GenerationContextPacket
+from backend.providers.errors import PermanentGenerationError, TransientGenerationError
 
 
 Transport = Callable[[str, dict[str, str], dict[str, Any], float], dict[str, Any]]
@@ -51,15 +52,7 @@ def _extract_json_payload(text: str) -> str:
 
 
 class NvidiaNIMLanguageModel:
-    """Hosted NVIDIA NIM adapter for the provider-agnostic burst contract.
-
-    The API key is read from ``NVIDIA_API_KEY`` by default and is never included
-    in prompts, return values, or exception messages created by this class.
-
-    Transport failures and output-contract failures are retried separately. A
-    hosted model can occasionally return prose or malformed JSON even after a
-    successful HTTP response; one bad sample should not kill a long replay run.
-    """
+    """Hosted NVIDIA NIM adapter for the provider-agnostic burst contract."""
 
     def __init__(
         self,
@@ -99,17 +92,11 @@ class NvidiaNIMLanguageModel:
     def _completion_payload(self, packet: GenerationContextPacket) -> dict[str, Any]:
         return {
             "model": self.model,
-            "messages": [
-                {
-                    "role": "user",
-                    "content": generation_prompt(packet),
-                }
-            ],
+            "messages": [{"role": "user", "content": generation_prompt(packet)}],
             "temperature": self.temperature,
             "top_p": self.top_p,
             "max_tokens": self.max_tokens,
             "stream": False,
-            # Persona replay needs terse observable text, not hidden reasoning.
             "chat_template_kwargs": {"enable_thinking": False},
         }
 
@@ -127,17 +114,24 @@ class NvidiaNIMLanguageModel:
                 return self._transport(url, headers, payload, self.timeout_seconds)
             except urllib.error.HTTPError as exc:
                 retryable = exc.code == 429 or 500 <= exc.code < 600
-                if not retryable or attempt >= self.max_attempts:
-                    raise RuntimeError(
-                        f"NVIDIA NIM request failed with HTTP {exc.code}"
+                if retryable:
+                    if attempt >= self.max_attempts:
+                        raise TransientGenerationError(
+                            f"NVIDIA NIM temporarily unavailable (HTTP {exc.code})"
+                        ) from exc
+                else:
+                    raise PermanentGenerationError(
+                        f"NVIDIA NIM request rejected (HTTP {exc.code})"
                     ) from exc
-            except urllib.error.URLError as exc:
+            except (urllib.error.URLError, TimeoutError) as exc:
                 if attempt >= self.max_attempts:
-                    raise RuntimeError("NVIDIA NIM request failed") from exc
+                    raise TransientGenerationError(
+                        "NVIDIA NIM network request temporarily failed"
+                    ) from exc
 
             time.sleep(min(2 ** (attempt - 1), 4))
 
-        raise RuntimeError("NVIDIA NIM request failed")
+        raise TransientGenerationError("NVIDIA NIM request temporarily failed")
 
     @staticmethod
     def _parse_burst(data: dict[str, Any]) -> GeneratedBurst:
@@ -160,6 +154,6 @@ class NvidiaNIMLanguageModel:
                 if attempt >= self.max_format_attempts:
                     break
 
-        raise ValueError(
-            "NVIDIA NIM failed the message JSON contract after format retries"
+        raise PermanentGenerationError(
+            "NVIDIA NIM returned an invalid message format"
         ) from last_error
