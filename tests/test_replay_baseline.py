@@ -130,6 +130,35 @@ def test_coarse_same_minute_delay_is_not_fitted_as_literal_zero_seconds() -> Non
     assert baseline.action_thresholds[Action.REPLY] == 30.0
 
 
+def test_ambiguous_long_gap_does_not_distort_action_specific_threshold() -> None:
+    normal = _case(
+        "normal",
+        platform="kakao",
+        previous_person_id="self",
+        delay_seconds=300,
+        weight=1.0,
+    )
+    long_gap = _case(
+        "long-gap",
+        platform="kakao",
+        previous_person_id="self",
+        delay_seconds=86400,
+        weight=10.0,
+    )
+    long_gap = replace(
+        long_gap,
+        session_restart=True,
+        action_is_ambiguous=True,
+    )
+
+    baseline = EmpiricalTimingBaseline.fit([normal, long_gap])
+
+    # The long-gap event still informs the global timing floor but cannot claim
+    # that one-day silence is a trustworthy REPLY-specific pattern.
+    assert baseline.action_thresholds[Action.REPLY] == 300.0
+    assert baseline.global_threshold == 86400.0
+
+
 def test_interval_aware_metric_does_not_penalize_prediction_inside_censored_range() -> None:
     train_case = _case(
         "train",
