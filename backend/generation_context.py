@@ -7,6 +7,12 @@ from typing import Sequence
 from backend.event_memory import EventMemorySnapshot, build_event_memory
 from backend.fusion import PersonEvidence
 from backend.persona.cutoff import CutoffLanguageProfile, build_cutoff_language_profile
+from backend.persona.style_fingerprint import (
+    BurstBehaviorProfile,
+    StyleFingerprint,
+    build_burst_behavior_profile,
+    build_style_fingerprint,
+)
 from backend.replay import ReplayCase
 from backend.retrieval import CutoffExampleIndex, RetrievedExample
 from backend.simulation.action_policy import Action
@@ -56,6 +62,9 @@ class GenerationContextPacket:
     action_role_ambiguous: bool = False
     topic_memory: TopicMemorySnapshot | None = None
     event_memory: EventMemorySnapshot | None = None
+    style_fingerprint: StyleFingerprint | None = None
+    burst_profile: BurstBehaviorProfile | None = None
+    generation_directives: tuple[str, ...] = ()
 
     def to_dict(self) -> dict[str, object]:
         return asdict(self)
@@ -113,13 +122,9 @@ def build_generation_context(
     action_specific_retrieval: bool = True,
     relationship_focus_multiplier: float = 2.0,
     topic_horizon_days: float = 120.0,
+    generation_directives: tuple[str, ...] = (),
 ) -> GenerationContextPacket:
-    """Build a cutoff-safe packet for replay or simulation generation.
-
-    The held-out target burst is never read here. Persona, retrieval, topic cues,
-    and explicit event/date cues all use observations strictly older than the
-    case cutoff. Historical response text is withheld unless an ablation opts in.
-    """
+    """Build a cutoff-safe person-specific packet for replay or live simulation."""
 
     if evidence.person_id != case.person_id:
         raise ValueError("case and evidence refer to different people")
@@ -143,6 +148,21 @@ def build_generation_context(
         focus_conversation_id=case.conversation_id,
         focus_platform=case.platform,
         focus_weight_multiplier=relationship_focus_multiplier,
+    )
+    style_fingerprint = build_style_fingerprint(
+        evidence,
+        case.observation_end,
+        focus_conversation_id=case.conversation_id,
+        focus_platform=case.platform,
+        focus_multiplier=max(1.0, relationship_focus_multiplier + 0.5),
+    )
+    burst_profile = build_burst_behavior_profile(
+        index.examples,
+        case.observation_end,
+        focus_conversation_id=case.conversation_id,
+        platform=case.platform,
+        action=chosen_action,
+        focus_multiplier=max(1.0, relationship_focus_multiplier + 0.5),
     )
     topic_memory = build_topic_memory(
         evidence,
@@ -177,4 +197,7 @@ def build_generation_context(
         action_role_ambiguous=case.action_is_ambiguous,
         topic_memory=topic_memory,
         event_memory=event_memory,
+        style_fingerprint=style_fingerprint,
+        burst_profile=burst_profile,
+        generation_directives=tuple(generation_directives),
     )
