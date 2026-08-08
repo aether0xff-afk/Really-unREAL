@@ -1,0 +1,176 @@
+name: Release v1.2.0
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/release-v1.2.0.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  statuses: write
+
+jobs:
+  release-windows:
+    runs-on: windows-latest
+    timeout-minutes: 35
+    env:
+      GH_TOKEN: ${{ github.token }}
+      NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install test and build dependencies
+        id: install
+        continue-on-error: true
+        run: python -m pip install -e ".[dev,build]"
+
+      - name: Verify v1.2.0 version
+        id: version
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $version = python -c "import backend; print(backend.__version__)"
+          if ($version.Trim() -ne "1.2.0") { throw "Expected 1.2.0, got $version" }
+
+      - name: Run full regression tests
+        id: tests
+        continue-on-error: true
+        run: pytest -q
+
+      - name: Import integrated 1.2 desktop runtime
+        id: import_gui
+        continue-on-error: true
+        run: >-
+          python -c "import backend.live_behavior; import backend.live_timing;
+          import backend.simulation.store; import backend.simulation.runtime;
+          import backend.generation_guard; import backend.gui_live;
+          import backend.gui_chat_window; import backend.gui_responsive;
+          import backend.gui_entry; print('v1.2.0 integrated import OK')"
+
+      - name: Check NVIDIA secret health
+        id: secret
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:NVIDIA_API_KEY)) { throw "NVIDIA_API_KEY repository secret is missing" }
+
+      - name: Check hosted NVIDIA NIM health
+        id: nvidia
+        if: steps.secret.outcome == 'success'
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $success = $false
+          for ($attempt = 1; $attempt -le 3; $attempt++) {
+            python -m backend.nvidia_smoke
+            if ($LASTEXITCODE -eq 0) { $success = $true; break }
+            if ($attempt -lt 3) { Start-Sleep -Seconds (5 * $attempt) }
+          }
+          if (-not $success) { throw "Hosted NVIDIA health check failed" }
+
+      - name: Build Windows executable
+        id: build
+        continue-on-error: true
+        run: pyinstaller --noconfirm --clean --onefile --windowed --name Really-unREAL backend/gui_entry.py
+
+      - name: Smoke test packaged executable
+        id: smoke
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          & .\dist\Really-unREAL.exe --smoke
+          exit $LASTEXITCODE
+
+      - name: Package portable ZIP
+        id: package
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force package | Out-Null
+          Copy-Item dist/Really-unREAL.exe package/Really-unREAL.exe
+          Copy-Item docs/QUICKSTART_GUI.md package/QUICKSTART.md
+          Compress-Archive -Path package/* -DestinationPath Really-unREAL-v1.2.0-Windows-x64.zip -Force
+
+      - name: Create or update v1.2.0 GitHub Release
+        id: release
+        if: >-
+          steps.install.outcome == 'success' &&
+          steps.version.outcome == 'success' &&
+          steps.tests.outcome == 'success' &&
+          steps.import_gui.outcome == 'success' &&
+          steps.build.outcome == 'success' &&
+          steps.smoke.outcome == 'success' &&
+          steps.package.outcome == 'success'
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          gh release view v1.2.0 *> $null
+          if ($LASTEXITCODE -eq 0) {
+            gh release edit v1.2.0 --title "Really-unREAL v1.2.0" --notes-file RELEASE_NOTES_v1.2.0.md
+            if ($LASTEXITCODE -ne 0) { throw "GitHub Release notes update failed" }
+            gh release upload v1.2.0 Really-unREAL-v1.2.0-Windows-x64.zip --clobber
+          } else {
+            gh release create v1.2.0 Really-unREAL-v1.2.0-Windows-x64.zip --target "$env:GITHUB_SHA" --title "Really-unREAL v1.2.0" --notes-file RELEASE_NOTES_v1.2.0.md
+          }
+          if ($LASTEXITCODE -ne 0) { throw "GitHub Release create/upload failed" }
+
+      - name: Publish v1.2.0 release statuses
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const outcomes = {
+              install: '${{ steps.install.outcome }}',
+              version: '${{ steps.version.outcome }}',
+              tests: '${{ steps.tests.outcome }}',
+              import: '${{ steps.import_gui.outcome }}',
+              secret: '${{ steps.secret.outcome }}',
+              nvidia: '${{ steps.nvidia.outcome }}',
+              build: '${{ steps.build.outcome }}',
+              exe_smoke: '${{ steps.smoke.outcome }}',
+              package: '${{ steps.package.outcome }}',
+              release: '${{ steps.release.outcome }}'
+            };
+            for (const [name, outcome] of Object.entries(outcomes)) {
+              const informational = name === 'secret' || name === 'nvidia';
+              await github.rest.repos.createCommitStatus({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                sha: context.sha,
+                state: outcome === 'success' ? 'success' : (informational ? 'error' : 'failure'),
+                context: `v1.2.0/${name}`,
+                description: `${informational ? 'external health' : 'gate'} ${name}: ${outcome}`.slice(0, 140)
+              });
+            }
+            const required = [
+              outcomes.install, outcomes.version, outcomes.tests, outcomes.import,
+              outcomes.build, outcomes.exe_smoke, outcomes.package, outcomes.release
+            ];
+            const ok = required.every(v => v === 'success');
+            await github.rest.repos.createCommitStatus({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              sha: context.sha,
+              state: ok ? 'success' : 'failure',
+              context: 'release-v1.2.0',
+              description: ok ? 'Really-unREAL v1.2.0 Windows release published' : 'v1.2.0 artifact validation failed'
+            });
+
+      - name: Fail when required artifact validation failed
+        if: >-
+          always() && (
+            steps.install.outcome != 'success' ||
+            steps.version.outcome != 'success' ||
+            steps.tests.outcome != 'success' ||
+            steps.import_gui.outcome != 'success' ||
+            steps.build.outcome != 'success' ||
+            steps.smoke.outcome != 'success' ||
+            steps.package.outcome != 'success' ||
+            steps.release.outcome != 'success'
+          )
+        run: exit 1
