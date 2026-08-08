@@ -55,6 +55,10 @@ class NvidiaNIMLanguageModel:
 
     The API key is read from ``NVIDIA_API_KEY`` by default and is never included
     in prompts, return values, or exception messages created by this class.
+
+    Transport failures and output-contract failures are retried separately. A
+    hosted model can occasionally return prose or malformed JSON even after a
+    successful HTTP response; one bad sample should not kill a long replay run.
     """
 
     def __init__(
@@ -68,6 +72,7 @@ class NvidiaNIMLanguageModel:
         max_tokens: int = 256,
         timeout_seconds: float = 90.0,
         max_attempts: int = 3,
+        max_format_attempts: int = 2,
         transport: Transport | None = None,
     ) -> None:
         resolved_key = api_key or os.environ.get("NVIDIA_API_KEY")
@@ -77,6 +82,8 @@ class NvidiaNIMLanguageModel:
             raise ValueError("max_tokens must be >= 1")
         if max_attempts < 1:
             raise ValueError("max_attempts must be >= 1")
+        if max_format_attempts < 1:
+            raise ValueError("max_format_attempts must be >= 1")
 
         self._api_key = resolved_key
         self.model = model
@@ -86,6 +93,7 @@ class NvidiaNIMLanguageModel:
         self.max_tokens = int(max_tokens)
         self.timeout_seconds = float(timeout_seconds)
         self.max_attempts = int(max_attempts)
+        self.max_format_attempts = int(max_format_attempts)
         self._transport = transport or _urllib_transport
 
     def _completion_payload(self, packet: GenerationContextPacket) -> dict[str, Any]:
@@ -131,8 +139,8 @@ class NvidiaNIMLanguageModel:
 
         raise RuntimeError("NVIDIA NIM request failed")
 
-    def generate_burst(self, packet: GenerationContextPacket) -> GeneratedBurst:
-        data = self._request_completion(packet)
+    @staticmethod
+    def _parse_burst(data: dict[str, Any]) -> GeneratedBurst:
         try:
             content = data["choices"][0]["message"]["content"]
         except (KeyError, IndexError, TypeError) as exc:
@@ -140,3 +148,18 @@ class NvidiaNIMLanguageModel:
         if not isinstance(content, str) or not content.strip():
             raise ValueError("NVIDIA NIM returned empty assistant content")
         return GeneratedBurst.from_json(_extract_json_payload(content))
+
+    def generate_burst(self, packet: GenerationContextPacket) -> GeneratedBurst:
+        last_error: ValueError | None = None
+        for attempt in range(1, self.max_format_attempts + 1):
+            data = self._request_completion(packet)
+            try:
+                return self._parse_burst(data)
+            except ValueError as exc:
+                last_error = exc
+                if attempt >= self.max_format_attempts:
+                    break
+
+        raise ValueError(
+            "NVIDIA NIM failed the message JSON contract after format retries"
+        ) from last_error
