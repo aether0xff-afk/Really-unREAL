@@ -1,10 +1,63 @@
-# Really-unREAL 1.0
+# Really-unREAL 1.0.1
 
 A local-first conversation-behavior digital-twin framework grounded in real message history.
 
-Really-unREAL does **not** claim to reconstruct hidden thoughts, feelings, attraction, or intent. Its target is narrower and testable: observable communication behavior — **when someone stays silent, when they reply or follow up, how they split messages, what language style they use, and which previously observed topics/events plausibly continue.**
+Really-unREAL does **not** claim to reconstruct hidden thoughts, feelings, attraction, or intent. It models narrower, observable behavior: **when someone stays silent, when they reply or follow up, how they split messages, how they write, and which previously observed topics/events plausibly continue.**
 
 > Make the most plausible behavior from the evidence, not the most entertaining behavior.
+
+## Start here — desktop GUI
+
+v1.0.1 adds a small Windows-friendly desktop UI around the v1.0 research core.
+
+### Portable Windows build
+
+1. Download `Really-unREAL-v1.0.1-Windows-x64.zip` from the GitHub Release or Actions artifact.
+2. Extract it.
+3. Run `Really-unREAL.exe`.
+4. Choose a KakaoTalk export ZIP.
+5. Confirm the automatically suggested **내 이름**.
+6. Pick a direct-chat **대화 상대**.
+7. Run **빠른 Audit (LLM 없음)** first.
+
+The portable executable does not require a separate Python installation. It does not install a background service and it does not send messages to KakaoTalk, Instagram, or any other real platform.
+
+For step-by-step details, see `docs/QUICKSTART_GUI.md`.
+
+### Run the GUI from source
+
+Python 3.11+:
+
+```bash
+python -m pip install -e '.[dev]'
+python -m backend.gui_entry
+```
+
+Installing the package also exposes the `really-unreal` GUI entry point.
+
+## What the GUI does
+
+The v1.0.1 GUI intentionally focuses on the safest simple path:
+
+```text
+Kakao ZIP
+   |
+   v
+suggest my display name -> user confirms
+   |
+   v
+choose direct-chat target
+   |
+   +--> Quick Audit (no LLM, no API key)
+   |
+   +--> Local OpenAI-compatible model
+   |
+   +--> NVIDIA NIM (explicit remote-context consent required)
+```
+
+Results are aggregate metrics by default. Raw private chat text and API keys are not written to the result JSON.
+
+The GUI does **not** replace advanced research workflows. Instagram fusion, SELF twin, dense retrieval, source ablation, Shadow Simulation, custom identity maps, and the persistent live runtime remain available through the CLI.
 
 ## What makes it different
 
@@ -43,35 +96,34 @@ PERSON twin  -> reproduce another explicitly mapped person's observable behavior
 SELF twin    -> reproduce the user's own observable behavior across relationships
 ```
 
-SELF mode is relationship-aware: if enough evidence exists, the user's style and reply timing for the current conversation override broader fallbacks. This avoids averaging together how one person talks to every friend.
+SELF mode is relationship-aware: if enough evidence exists, behavior in the current relationship overrides broader fallbacks rather than averaging how one person talks to everyone.
 
-## v1.0 capabilities
+## Core capabilities
 
 - KakaoTalk text/ZIP ingestion with minute-level timestamp precision metadata.
 - Meta/Instagram export ingestion and source-aware evidence fusion.
 - Conservative cross-platform identity mapping.
 - PERSON and SELF twin replay datasets.
 - Chronological train/validation/test Historical Replay with future-leakage barriers.
-- `WAIT / REPLY / INITIATE` behavior modeling; long-gap action roles may remain ambiguous rather than being falsely labeled.
+- `WAIT / REPLY / INITIATE` behavior modeling.
 - Interval-aware timing evaluation for coarse Kakao timestamps.
 - Relationship-aware empirical timing baseline.
-- Context-conditioned discrete hazard model, selected only when held-out validation beats the simpler baseline.
+- Context-conditioned discrete hazard timing model with validation-gated selection.
 - Relationship-conditioned language/style profiles.
-- Observable topic memory.
-- Observable event/date memory from explicit past mentions.
+- Observable topic memory and explicit event/date memory.
 - Cutoff-safe historical-situation retrieval.
 - Raw historical responses withheld from RAG by default to reduce nearest-neighbor copying.
 - Optional dense+lexical retrieval through an embedding-provider interface.
-- Provider-agnostic generation replay through the `BurstLanguageModel` contract.
+- Provider-agnostic generation through the `BurstLanguageModel` contract.
 - NVIDIA NIM and generic OpenAI-compatible local model adapters.
 - Same-case Kakao-only vs Kakao+Instagram ablation.
-- **Closed-loop Shadow Simulation:** hidden target messages are replaced by simulated messages and the resulting drift is scored.
-- **Persistent live runtime:** future actions are stored in SQLite, survive application restarts, and generate text only when due.
-- `REAL` and `SIMULATION` memories remain separate.
-- Remote private-context transmission is blocked unless explicitly enabled.
-- The core never automatically sends messages to a real messaging platform.
+- Closed-loop Shadow Simulation.
+- Persistent SQLite-backed live discrete-event runtime.
+- Strict separation of `REAL` and `SIMULATION` memories.
+- Remote private-context transmission blocked unless explicitly enabled.
+- No real messaging-platform auto-send API in the core.
 
-## Recommended workflow
+## Recommended research workflow
 
 ```text
 raw exports
@@ -87,13 +139,13 @@ closed-loop Shadow Simulation
 LiveSimulationEngine
 ```
 
-Do not jump straight from an imported chat log to live simulation. Replay and shadow evaluation exist specifically to catch a convincing-looking but behaviorally wrong model.
+Do not jump straight from an imported chat log to live simulation. Replay and shadow evaluation exist specifically to catch convincing-looking but behaviorally wrong models.
 
-## Quick start
+## Advanced CLI quick start
 
-Create and review a gitignored `identity.local.json` first.
+Create and review a gitignored `identity.local.json` first for advanced cross-platform/custom identity workflows.
 
-### 1. Audit behavior
+### Audit behavior
 
 PERSON twin:
 
@@ -115,7 +167,7 @@ python -m backend.replay_audit \
   --self-twin
 ```
 
-### 2. Generate/evaluate with a local model
+### Generate/evaluate with a local model
 
 ```bash
 python -m backend.replay_generate \
@@ -128,11 +180,11 @@ python -m backend.replay_generate \
   --sources both
 ```
 
-The default local endpoint is `http://127.0.0.1:1234/v1`, suitable for an OpenAI-compatible local server such as LM Studio or another compatible runtime.
+The default local endpoint is `http://127.0.0.1:1234/v1`, suitable for an OpenAI-compatible local server such as LM Studio.
 
-### 3. Optional hosted NVIDIA generation
+### Optional hosted NVIDIA generation
 
-Hosted generation contains private context. It therefore requires explicit consent:
+Hosted generation sends cutoff-safe private context to a remote endpoint and therefore requires explicit consent:
 
 ```bash
 python -m backend.replay_generate \
@@ -144,7 +196,7 @@ python -m backend.replay_generate \
   --allow-remote-private-context
 ```
 
-### 4. Closed-loop shadow test
+### Closed-loop shadow test
 
 ```bash
 python -m backend.shadow_audit \
@@ -157,24 +209,6 @@ python -m backend.shadow_audit \
   --model YOUR_LOCAL_MODEL
 ```
 
-Shadow Simulation keeps real counterpart messages as external input, hides the target's future, feeds simulated target messages into later context, and only then compares the resulting trajectory with reality.
-
-### 5. Optional local dense retrieval
-
-```bash
-python -m backend.replay_generate \
-  ./data/raw/kakao_bundle.zip \
-  ./data/raw/instagram_export.zip \
-  ./identity.local.json \
-  --self-twin \
-  --provider local \
-  --model YOUR_LOCAL_MODEL \
-  --embedding-base-url http://127.0.0.1:1234/v1 \
-  --embedding-model YOUR_EMBEDDING_MODEL
-```
-
-Only historical **context** is embedded for ranking; held-out or historical response text is not used as a semantic shortcut.
-
 ## Privacy model
 
 Private data is local by default.
@@ -186,7 +220,7 @@ SQLite simulation state   gitignored
 artifacts                  gitignored
 ```
 
-Loopback generation/embedding endpoints are permitted by default. Any non-loopback endpoint that receives private conversation context requires `--allow-remote-private-context`.
+Loopback generation/embedding endpoints are permitted by default. Any non-loopback endpoint that receives private conversation context requires explicit remote-context consent.
 
 The system distinguishes:
 
@@ -216,7 +250,7 @@ visible past
                         +-- hidden content used only for evaluation
 ```
 
-Train/validation/test are chronological, not random. Kakao minute timestamps are represented as feasible timing intervals rather than fake second-level truth.
+Train/validation/test are chronological, not random. Kakao minute timestamps are represented as feasible intervals rather than fake second-level truth.
 
 ## Retrieval and memory
 
@@ -231,29 +265,21 @@ retrieved historical situations
 response-shape statistics
 ```
 
-Raw old responses are hidden by default. Topic memory means "this relationship actually discussed this", not "the person secretly likes this". Event memory means "an event/date was mentioned", not "the event definitely happened".
+Raw old responses are hidden by default. Topic memory means "this relationship actually discussed this", not "the person secretly likes this".
 
 ## Live runtime
 
-`backend.simulation.runtime.LiveSimulationEngine` is the v1.0 local discrete-event core.
+`backend.simulation.runtime.LiveSimulationEngine` is the persistent local discrete-event core.
 
-- incoming counterpart messages replace idle initiation with a scheduled reply;
+- incoming counterpart messages can replace idle initiation with a scheduled reply;
 - future actions are persisted before generation;
 - `WAIT` does not invoke the LLM;
 - a due action invokes generation at the due time;
-- after restart, overdue pending events can be recovered;
+- overdue pending events can recover after restart;
 - generated messages are stored as `SIMULATION` only;
 - no real-platform sending API exists in the core.
 
-The runtime is a framework component, not a finished messenger UI.
-
-## Evaluation philosophy
-
-A plausible screenshot is not a benchmark.
-
-Really-unREAL evaluates timing, event existence, burst size, lexical overlap, token overlap, endings, question/laugh/cry behavior, and closed-loop event drift separately. More complex timing models are selected on validation only and do not earn credit merely for being sophisticated.
-
-A previous private development diagnostic across 13 sufficiently populated direct relationships produced roughly `0.597` macro balanced accuracy for the empirical timing floor, `0.669` for the hazard model alone, and `0.678` with validation-gated per-person model selection. These remain development diagnostics, not universal performance claims, and should be rerun after material model changes.
+The v1.0.1 GUI is currently a replay/audit front door; it is not yet a full messenger UI for the live runtime.
 
 ## Known limits
 
@@ -263,20 +289,34 @@ A previous private development diagnostic across 13 sufficiently populated direc
 - Dense retrieval quality depends on the embedding model and must beat the lexical floor empirically.
 - Sparse relationships fall back to broader behavior statistics.
 - Kakao exports cannot reveal true second-level reply timing.
-- The live core is not yet a polished mobile/desktop product UI.
+- The v1.0.1 GUI currently focuses on Kakao direct-chat PERSON replay; advanced modes remain CLI-first.
 - PERSON twins raise consent and impersonation concerns; SELF twin is the safer default product direction.
+- Windows portable binaries are currently unsigned community builds, so SmartScreen may warn.
+
+## Build from source
+
+```bash
+python -m pip install -e '.[dev,build]'
+pytest -q
+pyinstaller --noconfirm --clean --onefile --windowed --name Really-unREAL backend/gui_entry.py
+./dist/Really-unREAL.exe --smoke
+```
+
+The Windows workflow packages `Really-unREAL.exe` and `QUICKSTART.md` into `Really-unREAL-v1.0.1-Windows-x64.zip`. Before packaging, it executes the bundled `--smoke` path to verify timezone resources and core replay imports survived PyInstaller bundling.
 
 ## Status
 
-**v1.0 simulation core:** implemented.
+**v1.0 simulation core:** implemented.  
+**v1.0.1 desktop usability layer:** Windows build validated.
 
 - Phase 1 — ingest/profiles: implemented
 - Phase 1.5 — identity/source fusion: implemented
 - Phase 2 — leakage-safe Historical Replay + generation evaluation: implemented
 - Phase 3 — closed-loop Shadow Simulation: implemented baseline
 - Phase 4 — persistent real-time discrete-event runtime: implemented core
+- v1.0.1 — desktop quick-start GUI + portable Windows build: validated
 
-See `docs/V1_0.md`, `docs/HISTORICAL_REPLAY.md`, `docs/TEMPORAL_HAZARD.md`, `docs/CUTOFF_RAG.md`, and `docs/SELF_TWIN.md`.
+See `docs/QUICKSTART_GUI.md`, `docs/V1_0.md`, `docs/HISTORICAL_REPLAY.md`, `docs/TEMPORAL_HAZARD.md`, `docs/CUTOFF_RAG.md`, and `docs/SELF_TWIN.md`.
 
 ## Tests
 

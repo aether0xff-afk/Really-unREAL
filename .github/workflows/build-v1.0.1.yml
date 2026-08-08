@@ -1,0 +1,142 @@
+name: Build v1.0.1 Windows GUI
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - v1.0.1-friendly-gui
+    paths:
+      - "backend/**"
+      - "tests/**"
+      - "docs/QUICKSTART_GUI.md"
+      - "README.md"
+      - "RELEASE_NOTES_v1.0.1.md"
+      - "pyproject.toml"
+      - ".github/workflows/build-v1.0.1.yml"
+  pull_request:
+    paths:
+      - "backend/**"
+      - "tests/**"
+      - "docs/QUICKSTART_GUI.md"
+      - "README.md"
+      - "RELEASE_NOTES_v1.0.1.md"
+      - "pyproject.toml"
+      - ".github/workflows/build-v1.0.1.yml"
+
+permissions:
+  contents: read
+  statuses: write
+
+jobs:
+  windows-gui:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install test and build dependencies
+        run: python -m pip install -e ".[dev,build]"
+
+      - name: Run tests
+        id: tests
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          pytest -q --tb=short 2>&1 | Tee-Object -FilePath pytest-output.txt
+          exit $LASTEXITCODE
+
+      - name: Import GUI entry point
+        id: import_gui
+        continue-on-error: true
+        run: python -c "import backend.gui; import backend.gui_entry; print('GUI import OK')"
+
+      - name: Build portable executable
+        id: build
+        if: steps.tests.outcome == 'success' && steps.import_gui.outcome == 'success'
+        continue-on-error: true
+        run: pyinstaller --noconfirm --clean --onefile --windowed --name Really-unREAL backend/gui_entry.py
+
+      - name: Smoke test packaged executable
+        id: exe_smoke
+        if: steps.build.outcome == 'success'
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          & .\dist\Really-unREAL.exe --smoke
+          exit $LASTEXITCODE
+
+      - name: Package portable ZIP
+        id: package
+        if: steps.exe_smoke.outcome == 'success'
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force package | Out-Null
+          Copy-Item dist/Really-unREAL.exe package/Really-unREAL.exe
+          Copy-Item docs/QUICKSTART_GUI.md package/QUICKSTART.md
+          Compress-Archive -Path package/* -DestinationPath Really-unREAL-v1.0.1-Windows-x64.zip -Force
+
+      - name: Upload portable build
+        if: steps.package.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: Really-unREAL-v1.0.1-Windows-x64
+          path: Really-unREAL-v1.0.1-Windows-x64.zip
+          retention-days: 14
+
+      - name: Publish readable build statuses
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const entries = [
+              ['v1.0.1-tests', '${{ steps.tests.outcome }}', 'pytest'],
+              ['v1.0.1-gui-import', '${{ steps.import_gui.outcome }}', 'GUI import'],
+              ['v1.0.1-pyinstaller', '${{ steps.build.outcome }}', 'PyInstaller'],
+              ['v1.0.1-exe-smoke', '${{ steps.exe_smoke.outcome }}', 'packaged exe smoke'],
+              ['v1.0.1-package', '${{ steps.package.outcome }}', 'portable ZIP'],
+            ];
+            for (const [contextName, outcome, label] of entries) {
+              const ok = outcome === 'success';
+              await github.rest.repos.createCommitStatus({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                sha: context.sha,
+                state: ok ? 'success' : 'failure',
+                context: contextName,
+                description: ok ? `${label} passed` : `${label} outcome: ${outcome}`
+              });
+            }
+            if ('${{ steps.tests.outcome }}' !== 'success' && fs.existsSync('pytest-output.txt')) {
+              const lines = fs.readFileSync('pytest-output.txt', 'utf8').split(/\r?\n/);
+              const failed = lines.filter(line => line.startsWith('FAILED ')).slice(0, 6);
+              for (const line of failed) {
+                const short = line.replace(/^FAILED\s+/, '').replace(/\s+-\s+.*/, '').slice(0, 80);
+                await github.rest.repos.createCommitStatus({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  sha: context.sha,
+                  state: 'failure',
+                  context: `test-fail|${short}`,
+                  description: 'pytest failure'
+                });
+              }
+            }
+            const allOk = entries.every(([, outcome]) => outcome === 'success');
+            await github.rest.repos.createCommitStatus({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              sha: context.sha,
+              state: allOk ? 'success' : 'failure',
+              context: 'v1.0.1-windows-build',
+              description: allOk ? 'Tests passed and portable Windows GUI built' : 'v1.0.1 GUI build failed'
+            });
+
+      - name: Fail when validation failed
+        if: always() && (steps.tests.outcome != 'success' || steps.import_gui.outcome != 'success' || steps.build.outcome != 'success' || steps.exe_smoke.outcome != 'success' || steps.package.outcome != 'success')
+        run: exit 1
