@@ -84,6 +84,26 @@ def test_nvidia_adapter_uses_bearer_key_and_parses_json() -> None:
     assert "집ㅋㅋ" not in captured["payload"]["messages"][0]["content"]
 
 
+def test_nvidia_adapter_retries_when_model_breaks_json_contract() -> None:
+    calls = 0
+
+    def transport(url, headers, payload, timeout):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return {"choices": [{"message": {"content": "그냥 집이라고 답할게"}}]}
+        return {"choices": [{"message": {"content": '{"messages":["집"]}'}}]}
+
+    model = NvidiaNIMLanguageModel(
+        api_key="secret-test-key",
+        transport=transport,
+        max_format_attempts=2,
+    )
+
+    assert model.generate_burst(_packet()).messages == ("집",)
+    assert calls == 2
+
+
 def test_nvidia_adapter_requires_api_key(monkeypatch) -> None:
     monkeypatch.delenv("NVIDIA_API_KEY", raising=False)
 
