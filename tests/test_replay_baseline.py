@@ -1,3 +1,4 @@
+from dataclasses import replace
 from datetime import datetime, timedelta
 
 from backend.fusion import EvidenceContext, EvidenceMessage
@@ -128,12 +129,10 @@ def test_interval_aware_metric_does_not_penalize_prediction_inside_censored_rang
         delay_seconds=180,
         weight=1.0,
     )
-    test_case = ReplayCase(
-        **{
-            **test_case.__dict__,
-            "delay_lower_seconds": 120.0,
-            "delay_upper_seconds": 240.0,
-        }
+    test_case = replace(
+        test_case,
+        delay_lower_seconds=120.0,
+        delay_upper_seconds=240.0,
     )
     snapshots = [
         ActionSnapshot(
