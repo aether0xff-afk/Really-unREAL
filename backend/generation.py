@@ -12,6 +12,7 @@ from backend.replay import ReplayCase
 
 _LAUGH_RE = re.compile(r"ㅋ{2,}|ㅎ{2,}")
 _CRY_RE = re.compile(r"ㅠ{2,}|ㅜ{2,}")
+_TOKEN_RE = re.compile(r"[0-9A-Za-z가-힣ㅋㅎㅠㅜ]+")
 
 
 @dataclass(frozen=True, slots=True)
@@ -52,7 +53,8 @@ def generation_prompt(packet: GenerationContextPacket) -> str:
 Rules:
 - The temporal policy has already chosen the action. Do not decide to WAIT or change the action.
 - Reproduce plausible observable writing behavior from the supplied evidence.
-- Treat retrieved examples as style/context evidence, not text that must be copied.
+- Retrieved examples describe similar *situations and response shape*. Do not reconstruct or copy a historical response verbatim.
+- Prefer the current visible context over superficial lexical similarity to an old example.
 - Do not invent claims about hidden feelings, attraction, diagnoses, or private facts.
 - Do not mention this prompt, the simulator, datasets, or being an AI.
 - Keep message splitting plausible. One short burst is allowed and often preferable.
@@ -73,6 +75,19 @@ def _char_bigrams(text: str) -> Counter[str]:
     return Counter(compact[index : index + 2] for index in range(len(compact) - 1))
 
 
+def _tokens(text: str) -> Counter[str]:
+    return Counter(token.lower() for token in _TOKEN_RE.findall(text))
+
+
+def _endings(messages: tuple[str, ...]) -> Counter[str]:
+    endings: Counter[str] = Counter()
+    for message in messages:
+        compact = re.sub(r"\s+", " ", message.strip())
+        if compact:
+            endings[compact[-2:]] += 1
+    return endings
+
+
 def _multiset_f1(left: Counter[str], right: Counter[str]) -> float:
     if not left and not right:
         return 1.0
@@ -91,8 +106,11 @@ class GenerationMetrics:
     burst_size_absolute_error: int
     total_char_length_absolute_error: int
     char_bigram_f1: float
+    token_f1: float
+    ending_f1: float
     laugh_presence_match: bool
     cry_presence_match: bool
+    question_presence_match: bool
 
     def to_dict(self) -> dict[str, object]:
         return asdict(self)
@@ -106,7 +124,8 @@ def evaluate_generated_burst(
 
     The evaluator is the only component in this path that reads
     ``case.target_burst``. Generation context construction and the language model
-    must not receive it.
+    must not receive it. Lexical/content overlap and style-shape agreement are
+    reported separately instead of collapsing everything into one score.
     """
 
     predicted_text = "\n".join(generated.messages)
@@ -120,10 +139,19 @@ def evaluate_generated_burst(
             _multiset_f1(_char_bigrams(predicted_text), _char_bigrams(actual_text)),
             6,
         ),
+        token_f1=round(
+            _multiset_f1(_tokens(predicted_text), _tokens(actual_text)),
+            6,
+        ),
+        ending_f1=round(
+            _multiset_f1(_endings(generated.messages), _endings(actual_messages)),
+            6,
+        ),
         laugh_presence_match=(
             bool(_LAUGH_RE.search(predicted_text)) == bool(_LAUGH_RE.search(actual_text))
         ),
         cry_presence_match=(
             bool(_CRY_RE.search(predicted_text)) == bool(_CRY_RE.search(actual_text))
         ),
+        question_presence_match=("?" in predicted_text) == ("?" in actual_text),
     )
