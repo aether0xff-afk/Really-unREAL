@@ -59,13 +59,27 @@ def generation_prompt(packet: GenerationContextPacket) -> str:
             "or change the action."
         )
 
+    if packet.chosen_action == "INITIATE":
+        topic_rule = (
+            "- For INITIATE, prefer continuity with observable topic_memory cues when "
+            "they fit. Do not invent a new private event, plan, preference, or hidden "
+            "motivation just to make the initiation interesting."
+        )
+    else:
+        topic_rule = (
+            "- For REPLY, answer the visible conversation first. topic_memory is only "
+            "background continuity and must not override the current message."
+        )
+
     return f"""You generate only the observable message burst for a conversation simulator.
 
 Rules:
 {action_rule}
+{topic_rule}
 - Reproduce plausible observable writing behavior from the supplied evidence.
 - Retrieved examples describe similar *situations and response shape*. Do not reconstruct or copy a historical response verbatim.
 - Prefer the current visible context over superficial lexical similarity to an old example.
+- Treat topic_memory as observable conversation continuity, never as proof of a hidden interest or feeling.
 - Do not invent claims about hidden feelings, attraction, diagnoses, or private facts.
 - Do not mention this prompt, the simulator, datasets, or being an AI.
 - Keep message splitting plausible. One short burst is allowed and often preferable.
