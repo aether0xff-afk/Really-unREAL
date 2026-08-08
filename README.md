@@ -31,7 +31,8 @@ The current pipeline can:
 6. Fuse approved aliases into stable local person IDs while preserving source/context relevance.
 7. Build leakage-safe Historical Replay events with `WAIT / REPLY / INITIATE`, timing intervals, and message bursts.
 8. Split replay chronologically into train / validation / test.
-9. Expose local audit tools without committing private source data.
+9. Fit/evaluate a weighted empirical timing baseline on held-out later replay events.
+10. Expose local audit tools without committing private source data.
 
 KakaoTalk text analysis:
 
@@ -72,6 +73,8 @@ python -m backend.replay_audit \
   ./identity.local.json \
   person-001
 ```
+
+The replay audit also fits the simple training-split timing baseline and reports held-out test metrics.
 
 Run tests with:
 
@@ -117,6 +120,8 @@ visible past
 
 KakaoTalk minute timestamps are treated as interval-censored rather than fake second-level truth. Direct conversations are the default action/timing benchmark; group messages remain useful supporting persona evidence but are excluded from behavioral labels unless explicitly requested.
 
+The first floor model is a weighted empirical timing quantile. It uses only visible action context and past timing statistics, with KakaoTalk carrying more evidence weight than supplemental Instagram data. More complex temporal models must beat this baseline on later held-out history.
+
 See `docs/HISTORICAL_REPLAY.md` for the evaluation contract.
 
 ## Architecture
@@ -161,7 +166,8 @@ The temporal/action layer sits **above** the language model. The model should no
 - **Phase 1:** parsing + observable profiles — scaffold implemented
 - **Phase 1.5:** source fusion and per-person identity resolution — scaffold implemented
 - **Phase 2A:** Historical Replay dataset/labels/splits — implemented
-- **Phase 2B:** empirical/survival temporal baseline — next
+- **Phase 2B:** weighted empirical timing baseline — implemented
+- **Phase 2B.1:** context-conditioned survival/hazard timing model — next
 - **Phase 2C:** cutoff-safe RAG + persona language generation
 - **Phase 2D:** Kakao-only vs Kakao+Instagram ablation
 - **Phase 3:** shadow simulation against a past time interval
