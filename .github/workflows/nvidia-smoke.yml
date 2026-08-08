@@ -10,6 +10,10 @@ on:
       - "backend/providers/nvidia.py"
       - "backend/generation.py"
       - "backend/generation_context.py"
+      - "backend/topic_memory.py"
+      - "backend/event_memory.py"
+      - "backend/replay_generation.py"
+      - "backend/simulation/**"
 
 permissions:
   contents: read
@@ -18,7 +22,7 @@ permissions:
 jobs:
   hosted-nim-smoke:
     runs-on: ubuntu-latest
-    timeout-minutes: 8
+    timeout-minutes: 10
     env:
       NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
     steps:
@@ -27,7 +31,11 @@ jobs:
         with:
           python-version: "3.12"
       - name: Install project
-        run: python -m pip install -e .
+        run: python -m pip install -e '.[dev]'
+      - name: Run v1 core tests
+        id: core_tests
+        continue-on-error: true
+        run: python -m pytest -q
       - name: Verify secret is configured
         id: secret
         continue-on-error: true
@@ -62,8 +70,10 @@ jobs:
         with:
           script: |
             const fs = require('fs');
+            const testsSuccess = '${{ steps.core_tests.outcome }}' === 'success';
             const smokeSuccess = '${{ steps.secret.outcome }}' === 'success' && '${{ steps.smoke.outcome }}' === 'success';
             const conversationSuccess = '${{ steps.conversation.outcome }}' === 'success';
+            const releaseSuccess = testsSuccess && smokeSuccess && conversationSuccess;
             await github.rest.repos.createCommitStatus({
               owner: context.repo.owner,
               repo: context.repo.repo,
@@ -80,6 +90,14 @@ jobs:
               context: 'nvidia-conversation-smoke',
               description: conversationSuccess ? 'Four-turn project conversation passed' : 'Four-turn project conversation failed'
             });
+            await github.rest.repos.createCommitStatus({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              sha: context.sha,
+              state: releaseSuccess ? 'success' : 'failure',
+              context: 'v1-release-smoke',
+              description: releaseSuccess ? 'v1 core tests + hosted generation passed' : 'v1 release smoke failed'
+            });
             if (conversationSuccess && fs.existsSync('nvidia-conversation-smoke.json')) {
               const data = JSON.parse(fs.readFileSync('nvidia-conversation-smoke.json', 'utf8'));
               for (const turn of data.turns) {
@@ -94,6 +112,6 @@ jobs:
                 });
               }
             }
-      - name: Fail job when smoke failed
-        if: always() && (steps.secret.outcome != 'success' || steps.smoke.outcome != 'success' || steps.conversation.outcome != 'success')
+      - name: Fail job when release smoke failed
+        if: always() && (steps.core_tests.outcome != 'success' || steps.secret.outcome != 'success' || steps.smoke.outcome != 'success' || steps.conversation.outcome != 'success')
         run: exit 1
