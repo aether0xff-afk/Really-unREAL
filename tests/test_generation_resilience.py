@@ -199,6 +199,7 @@ def test_new_user_message_during_claim_does_not_cancel_or_block_wrong_reply(tmp_
     )
     claimed_reply = next(item for item in claimed if item.action == Action.REPLY)
     assert claimed_reply.status == "CLAIMED"
+    assert claimed_reply.claim_token is not None
 
     second = session.send_user_message("추가 질문", now=first.due_at + timedelta(seconds=2))
     assert second is not None
@@ -206,9 +207,13 @@ def test_new_user_message_during_claim_does_not_cancel_or_block_wrong_reply(tmp_
     assert session.store.event(first.event_id).status == "CLAIMED"
     assert session.store.event(second.event_id).status == "PENDING"
 
-    # A failure belongs to the exact claimed event, not whichever event happens
-    # to be first in pending-event ordering now.
-    session.store.block_event(first.event_id, error="old generation failed")
+    # A failure belongs to the exact claimed generation, not whichever event
+    # happens to be first in pending-event ordering now.
+    session.store.block_event(
+        first.event_id,
+        error="old generation failed",
+        claim_token=claimed_reply.claim_token,
+    )
     assert session.store.event(first.event_id).status == "BLOCKED"
     assert session.store.event(second.event_id).status == "PENDING"
 
