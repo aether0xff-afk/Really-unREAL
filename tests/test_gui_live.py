@@ -4,6 +4,7 @@ from backend.generation import GeneratedBurst
 from backend.gui_live import LiveChatSession
 from backend.gui_support import LOCAL_BASE_URL
 from backend.ingest.archive import ConversationExport
+from backend.live_timing import LiveTimingSample
 from backend.models import ChatMessage, MemorySource
 from backend.simulation.action_policy import Action
 
@@ -61,6 +62,42 @@ class FixedTiming:
 class FixedRead:
     def sample_delay_seconds(self, reply_delay_seconds):
         return min(10.0, float(reply_delay_seconds))
+
+
+class InvalidStructuredTiming:
+    model_name = "invalid-structured"
+
+    def sample_timing(
+        self,
+        *,
+        platform,
+        conversation_id,
+        action,
+        observed_at=None,
+        visible_context=(),
+    ):
+        return LiveTimingSample.invalid()
+
+    def sample_delay_seconds(self, **kwargs):
+        raise AssertionError("structured runtime must not fall through to scalar API")
+
+
+class NoEvidenceStructuredTiming:
+    model_name = "no-evidence-structured"
+
+    def sample_timing(
+        self,
+        *,
+        platform,
+        conversation_id,
+        action,
+        observed_at=None,
+        visible_context=(),
+    ):
+        return LiveTimingSample.no_evidence()
+
+    def sample_delay_seconds(self, **kwargs):
+        raise AssertionError("structured runtime must not fall through to scalar API")
 
 
 def _session(tmp_path) -> LiveChatSession:
@@ -211,3 +248,26 @@ def test_live_chat_reset_never_touches_real_evidence(tmp_path) -> None:
     session.reset()
     assert session.chat_messages() == []
     assert original.messages[-1].text == "ㅇㅇ"
+
+
+def test_structured_invalid_timing_cannot_be_resurrected_by_baseline(tmp_path) -> None:
+    session = _session(tmp_path)
+    session.engine.timing_sampler = InvalidStructuredTiming()
+    session.engine.read_timing_model = None
+
+    now = BASE + timedelta(days=7)
+    reply = session.send_user_message("이 행동은 timing gate에서 불가능", now=now)
+    assert reply is None
+    assert not [event for event in session.pending_events() if event.action == Action.REPLY]
+
+
+def test_only_no_evidence_structured_timing_uses_empirical_baseline(tmp_path) -> None:
+    session = _session(tmp_path)
+    session.engine.timing_sampler = NoEvidenceStructuredTiming()
+    session.engine.read_timing_model = None
+
+    now = BASE + timedelta(days=8)
+    reply = session.send_user_message("근거 부족이면 baseline", now=now)
+    assert reply is not None
+    assert reply.action == Action.REPLY
+    assert reply.due_at > now
