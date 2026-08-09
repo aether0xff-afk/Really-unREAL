@@ -1,14 +1,16 @@
 from __future__ import annotations
 
+import math
 import random
 import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from enum import StrEnum
 from typing import Iterable, Sequence
 
 from backend.fusion import EvidenceMessage
 from backend.replay import ReplayCase, chronological_split
-from backend.replay_hazard import DiscreteHazardModel, select_temporal_model
+from backend.replay_hazard import ELAPSED_BINS_SECONDS, DiscreteHazardModel, select_temporal_model
 from backend.simulation.action_policy import Action, MESSAGE_ACTIONS
 
 
@@ -34,6 +36,7 @@ _QUESTION_STEMS = (
     "맞음",
     "맞아",
 )
+_SESSION_GAP_SECONDS = 6.0 * 3600.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -44,6 +47,37 @@ class LiveTimingFeatures:
     previous_gap: str
     since_last: str
     last_message_kind: str
+
+
+class TimingSampleKind(StrEnum):
+    """Why a live timing request did or did not produce a delay.
+
+    ``NO_EVIDENCE`` is the only result that may safely fall back to a broader
+    empirical baseline. ``INVALID`` means the requested action is not possible
+    in the current observable state and must never be resurrected by fallback.
+    """
+
+    SAMPLED = "SAMPLED"
+    NO_EVIDENCE = "NO_EVIDENCE"
+    INVALID = "INVALID"
+
+
+@dataclass(frozen=True, slots=True)
+class LiveTimingSample:
+    kind: TimingSampleKind
+    delay_seconds: float | None = None
+
+    @classmethod
+    def sampled(cls, delay_seconds: float) -> "LiveTimingSample":
+        return cls(TimingSampleKind.SAMPLED, max(0.0, float(delay_seconds)))
+
+    @classmethod
+    def no_evidence(cls) -> "LiveTimingSample":
+        return cls(TimingSampleKind.NO_EVIDENCE, None)
+
+    @classmethod
+    def invalid(cls) -> "LiveTimingSample":
+        return cls(TimingSampleKind.INVALID, None)
 
 
 def classify_message_kind(text: str) -> str:
@@ -166,9 +200,15 @@ class BurstGapSampler:
 class ContextualLiveTimingSampler:
     """Context-aware live timing with validation-gated hazard deployment.
 
-    A validated hazard model gets first priority. Empirical context cells are used
-    only when the richer model did not earn deployment, and fine cells require a
-    minimum support floor instead of letting n=3 override validation evidence.
+    The behavior policy owns whether an event exists. Once REPLY/FOLLOW_UP/
+    INITIATE has been selected, this class only samples *when* that event occurs.
+    A richer hazard model is therefore sampled conditional on an event occurring,
+    rather than using its residual survival mass as a second hidden WAIT policy.
+
+    FOLLOW_UP and INITIATE retain hard session-role support. The current replay
+    hazard changes role as elapsed silence crosses six hours, so v1.2.1 keeps
+    those two roles on action-specific empirical timing until an explicitly
+    action-conditioned survival model is introduced.
     """
 
     def __init__(
@@ -220,6 +260,15 @@ class ContextualLiveTimingSampler:
         lower = max(0.0, float(chosen.delay_lower_seconds))
         upper = max(lower, float(chosen.delay_upper_seconds))
         return lower if lower == upper else self._rng.uniform(lower, upper)
+
+    @staticmethod
+    def _constrain_action_delay(action: Action, delay_seconds: float) -> float:
+        delay = max(0.0, float(delay_seconds))
+        if action == Action.FOLLOW_UP:
+            return min(delay, _SESSION_GAP_SECONDS)
+        if action == Action.INITIATE:
+            return max(delay, math.nextafter(_SESSION_GAP_SECONDS, math.inf))
+        return delay
 
     def _confident_action_cases(self, action: Action) -> list[ReplayCase]:
         return [
@@ -328,6 +377,91 @@ class ContextualLiveTimingSampler:
             action_is_ambiguous=False,
         )
 
+    def _sample_hazard_given_event(self, case: ReplayCase) -> float | None:
+        """Sample the hazard distribution conditional on an event occurring.
+
+        ``DiscreteHazardModel.sample_delay_seconds`` intentionally returns None
+        for residual survival mass. That is useful for replay action prediction,
+        but live v1.2 already made the REPLY-vs-WAIT decision before timing.
+        Here we renormalize only the event mass and sample a delay from it.
+        """
+
+        if self._hazard is None:
+            return None
+        survival = 1.0
+        bins: list[tuple[float, float, float]] = []
+        for bin_index in range(len(ELAPSED_BINS_SECONDS) - 1):
+            start = float(ELAPSED_BINS_SECONDS[bin_index])
+            end = float(ELAPSED_BINS_SECONDS[bin_index + 1])
+            hazard = min(
+                1.0,
+                max(0.0, self._hazard.hazard_probability(case, elapsed_seconds=start)),
+            )
+            event_mass = survival * hazard
+            if event_mass > 0.0:
+                bins.append((start, end, event_mass))
+            survival *= 1.0 - hazard
+
+        total_mass = sum(mass for _, _, mass in bins)
+        if total_mass <= 0.0:
+            return None
+        target = self._rng.random() * total_mass
+        cumulative = 0.0
+        for start, end, mass in bins:
+            cumulative += mass
+            if target <= cumulative:
+                return start if start == end else self._rng.uniform(start, end)
+        start, end, _ = bins[-1]
+        return start if start == end else self._rng.uniform(start, end)
+
+    def sample_timing(
+        self,
+        *,
+        platform: str,
+        conversation_id: str,
+        action: Action,
+        observed_at: datetime | None = None,
+        visible_context: Sequence[EvidenceMessage] = (),
+    ) -> LiveTimingSample:
+        if action in {Action.WAIT, Action.READ}:
+            return LiveTimingSample.invalid()
+        if not self._action_is_valid(action, visible_context):
+            return LiveTimingSample.invalid()
+        if not self._confident_action_cases(action):
+            return LiveTimingSample.no_evidence()
+
+        observed_at = observed_at or datetime.now()
+
+        # The current hazard representation changes FOLLOW_UP -> INITIATE as
+        # elapsed time crosses the six-hour boundary. Using it after the action
+        # has already been selected can therefore violate the requested role.
+        # Keep hazard live sampling to REPLY until the hazard itself is explicitly
+        # conditioned on a fixed action role.
+        if self._hazard is not None and action == Action.REPLY:
+            live_case = self._live_case(
+                platform=platform,
+                conversation_id=conversation_id,
+                action=action,
+                observed_at=observed_at,
+                visible_context=visible_context,
+            )
+            if live_case is not None:
+                sampled = self._sample_hazard_given_event(live_case)
+                if sampled is not None:
+                    return LiveTimingSample.sampled(sampled)
+
+        candidates = self._contextual_candidates(
+            platform=platform,
+            conversation_id=conversation_id,
+            action=action,
+            observed_at=observed_at,
+            visible_context=visible_context,
+        )
+        if not candidates:
+            return LiveTimingSample.no_evidence()
+        delay = self._sample_case(candidates)
+        return LiveTimingSample.sampled(self._constrain_action_delay(action, delay))
+
     def sample_delay_seconds(
         self,
         *,
@@ -337,35 +471,18 @@ class ContextualLiveTimingSampler:
         observed_at: datetime | None = None,
         visible_context: Sequence[EvidenceMessage] = (),
     ) -> float | None:
-        if action in {Action.WAIT, Action.READ}:
-            return None
-        if not self._action_is_valid(action, visible_context):
-            return None
-        if not self._confident_action_cases(action):
-            return None
+        """Backward-compatible scalar API.
 
-        observed_at = observed_at or datetime.now()
+        New runtime code should use ``sample_timing`` so INVALID and NO_EVIDENCE
+        remain distinguishable. Older callers still receive the historical
+        ``float | None`` shape.
+        """
 
-        if self._hazard is not None:
-            live_case = self._live_case(
-                platform=platform,
-                conversation_id=conversation_id,
-                action=action,
-                observed_at=observed_at,
-                visible_context=visible_context,
-            )
-            if live_case is not None:
-                sampled = self._hazard.sample_delay_seconds(
-                    live_case,
-                    seed=self._rng.randrange(0, 2**32),
-                )
-                return None if sampled is None else max(0.0, float(sampled))
-
-        candidates = self._contextual_candidates(
+        sample = self.sample_timing(
             platform=platform,
             conversation_id=conversation_id,
             action=action,
             observed_at=observed_at,
             visible_context=visible_context,
         )
-        return self._sample_case(candidates) if candidates else None
+        return sample.delay_seconds if sample.kind == TimingSampleKind.SAMPLED else None
