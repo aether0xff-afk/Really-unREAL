@@ -9,7 +9,7 @@ from backend.fusion import EvidenceMessage, PersonEvidence
 from backend.generation import BurstLanguageModel, GeneratedBurst
 from backend.generation_context import build_generation_context
 from backend.live_behavior import LatentReadTimingModel, LiveResponsePolicy, TargetContinuationPolicy
-from backend.live_timing import BurstGapSampler
+from backend.live_timing import BurstGapSampler, TimingSampleKind
 from backend.models import ChatMessage, MemorySource
 from backend.providers.errors import PermanentGenerationError, TransientGenerationError
 from backend.replay import ReplayCase
@@ -98,6 +98,12 @@ def _direct_contexts(platform: str):
     return (EvidenceContext.INSTAGRAM_DIRECT,)
 
 
+def _claim_token(event: ScheduledEvent) -> str:
+    if not event.claim_token:
+        raise RuntimeError(f"claimed event {event.event_id} has no claim token")
+    return event.claim_token
+
+
 class LiveSimulationEngine:
     """Persistent discrete-event runtime with behavior/provider separation."""
 
@@ -146,15 +152,37 @@ class LiveSimulationEngine:
         visible_context: Sequence[EvidenceMessage] = (),
     ) -> float | None:
         if self.timing_sampler is not None:
-            sampled = self.timing_sampler.sample_delay_seconds(
-                platform=self.platform,
-                conversation_id=self.conversation_id,
-                action=action,
-                observed_at=observed_at,
-                visible_context=visible_context,
-            )
-            if sampled is not None:
-                return max(0.0, float(sampled))
+            # v1.2.1 structured samplers distinguish "no evidence" from
+            # "this action is impossible here". Only missing evidence may use
+            # the broad baseline. An INVALID result must stay invalid.
+            sample_timing = getattr(self.timing_sampler, "sample_timing", None)
+            if callable(sample_timing):
+                sample = sample_timing(
+                    platform=self.platform,
+                    conversation_id=self.conversation_id,
+                    action=action,
+                    observed_at=observed_at,
+                    visible_context=visible_context,
+                )
+                if sample.kind == TimingSampleKind.SAMPLED:
+                    if sample.delay_seconds is None:
+                        raise RuntimeError("SAMPLED timing result has no delay")
+                    return max(0.0, float(sample.delay_seconds))
+                if sample.kind != TimingSampleKind.NO_EVIDENCE:
+                    return None
+            else:
+                # Backward-compatible path for external/custom samplers that
+                # still expose only the pre-1.2.1 scalar API.
+                sampled = self.timing_sampler.sample_delay_seconds(
+                    platform=self.platform,
+                    conversation_id=self.conversation_id,
+                    action=action,
+                    observed_at=observed_at,
+                    visible_context=visible_context,
+                )
+                if sampled is not None:
+                    return max(0.0, float(sampled))
+
         return _delay_for(
             self.timing,
             platform=self.platform,
@@ -336,11 +364,28 @@ class LiveSimulationEngine:
         seconds = _RETRY_DELAYS_SECONDS[
             min(event.generation_attempts, len(_RETRY_DELAYS_SECONDS) - 1)
         ]
-        self.store.defer_event(
-            event.event_id,
-            retry_at=now + timedelta(seconds=seconds),
-            error=str(error),
-        )
+        try:
+            self.store.defer_event(
+                event.event_id,
+                retry_at=now + timedelta(seconds=seconds),
+                error=str(error),
+                claim_token=_claim_token(event),
+            )
+        except KeyError:
+            # The claim may have gone stale and been re-owned while this worker
+            # was inside the provider call. A stale worker must not mutate the
+            # newer generation attempt.
+            pass
+
+    def _block_claimed(self, event: ScheduledEvent, error: Exception) -> None:
+        try:
+            self.store.block_event(
+                event.event_id,
+                error=str(error),
+                claim_token=_claim_token(event),
+            )
+        except KeyError:
+            pass
 
     def process_due(
         self,
@@ -357,25 +402,30 @@ class LiveSimulationEngine:
         )
 
         for event in claimed:
+            token = _claim_token(event)
             if event.action == Action.READ:
-                self.store.mark_messages_read(
-                    twin_person_id=self.twin_person_id,
-                    platform=self.platform,
-                    conversation_id=self.conversation_id,
-                    sender_person_id="self",
-                    read_at=event.due_at,
-                    sent_before_or_at=event.due_at,
-                    source="SIMULATION_LATENT_READ",
-                )
                 try:
-                    self.store.complete_claimed_event(event.event_id)
+                    self.store.complete_claimed_read_event(
+                        event_id=event.event_id,
+                        claim_token=token,
+                        twin_person_id=self.twin_person_id,
+                        platform=self.platform,
+                        conversation_id=self.conversation_id,
+                        sender_person_id="self",
+                        read_at=event.due_at,
+                        sent_before_or_at=event.due_at,
+                        source="SIMULATION_LATENT_READ",
+                    )
                 except KeyError:
                     pass
                 continue
 
             if event.action not in MESSAGE_ACTIONS:
                 try:
-                    self.store.complete_claimed_event(event.event_id)
+                    self.store.complete_claimed_event(
+                        event.event_id,
+                        claim_token=token,
+                    )
                 except KeyError:
                     pass
                 continue
@@ -406,16 +456,17 @@ class LiveSimulationEngine:
                 self._defer_transient(event, now=now, error=exc)
                 continue
             except PermanentGenerationError as exc:
-                self.store.block_event(event.event_id, error=str(exc))
+                self._block_claimed(event, exc)
                 continue
             except Exception as exc:
-                self.store.block_event(event.event_id, error=str(exc))
+                self._block_claimed(event, exc)
                 continue
 
             timestamped = self._timestamp_burst(event, burst)
             try:
                 self.store.complete_claimed_event_with_messages(
                     event_id=event.event_id,
+                    claim_token=token,
                     twin_person_id=self.twin_person_id,
                     platform=self.platform,
                     conversation_id=self.conversation_id,

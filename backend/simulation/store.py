@@ -39,7 +39,13 @@ class ScheduledEvent:
 
 
 class SQLiteSimulationStore:
-    """Durable local state with atomic event claiming and completion."""
+    """Durable local state with atomic event claiming and completion.
+
+    A CLAIMED event is owned by the exact ``claim_token`` returned from
+    ``claim_due_events``. Recovery deliberately destroys that token. Any worker
+    that finishes after recovery/re-claim must therefore fail its write instead
+    of committing output into a newer generation attempt.
+    """
 
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path)
@@ -344,31 +350,54 @@ class SQLiteSimulationStore:
         *,
         retry_at: datetime,
         error: str,
+        claim_token: str | None = None,
     ) -> ScheduledEvent:
         with self._connect() as db:
-            cursor = db.execute(
-                "UPDATE scheduled_events SET status='RETRY',next_attempt_at=?,"
-                "generation_attempts=generation_attempts+1,last_error=?,claim_token=NULL,"
-                "claimed_at=NULL WHERE event_id=? AND status IN ('PENDING','RETRY','CLAIMED')",
-                (retry_at.isoformat(), error[:500], event_id),
-            )
+            if claim_token is None:
+                cursor = db.execute(
+                    "UPDATE scheduled_events SET status='RETRY',next_attempt_at=?,"
+                    "generation_attempts=generation_attempts+1,last_error=?,claim_token=NULL,"
+                    "claimed_at=NULL WHERE event_id=? AND status IN ('PENDING','RETRY')",
+                    (retry_at.isoformat(), error[:500], event_id),
+                )
+            else:
+                cursor = db.execute(
+                    "UPDATE scheduled_events SET status='RETRY',next_attempt_at=?,"
+                    "generation_attempts=generation_attempts+1,last_error=?,claim_token=NULL,"
+                    "claimed_at=NULL WHERE event_id=? AND status='CLAIMED' AND claim_token=?",
+                    (retry_at.isoformat(), error[:500], event_id, claim_token),
+                )
             if cursor.rowcount != 1:
-                raise KeyError(f"retryable scheduled event not found: {event_id}")
+                raise KeyError(f"retryable scheduled event not owned by caller: {event_id}")
             row = db.execute(
                 "SELECT * FROM scheduled_events WHERE event_id=?", (event_id,)
             ).fetchone()
         return self._scheduled_from_row(row)
 
-    def block_event(self, event_id: str, *, error: str) -> ScheduledEvent:
+    def block_event(
+        self,
+        event_id: str,
+        *,
+        error: str,
+        claim_token: str | None = None,
+    ) -> ScheduledEvent:
         with self._connect() as db:
-            cursor = db.execute(
-                "UPDATE scheduled_events SET status='BLOCKED',next_attempt_at=NULL,"
-                "generation_attempts=generation_attempts+1,last_error=?,claim_token=NULL,"
-                "claimed_at=NULL WHERE event_id=? AND status IN ('PENDING','RETRY','CLAIMED')",
-                (error[:500], event_id),
-            )
+            if claim_token is None:
+                cursor = db.execute(
+                    "UPDATE scheduled_events SET status='BLOCKED',next_attempt_at=NULL,"
+                    "generation_attempts=generation_attempts+1,last_error=?,claim_token=NULL,"
+                    "claimed_at=NULL WHERE event_id=? AND status IN ('PENDING','RETRY')",
+                    (error[:500], event_id),
+                )
+            else:
+                cursor = db.execute(
+                    "UPDATE scheduled_events SET status='BLOCKED',next_attempt_at=NULL,"
+                    "generation_attempts=generation_attempts+1,last_error=?,claim_token=NULL,"
+                    "claimed_at=NULL WHERE event_id=? AND status='CLAIMED' AND claim_token=?",
+                    (error[:500], event_id, claim_token),
+                )
             if cursor.rowcount != 1:
-                raise KeyError(f"active scheduled event not found: {event_id}")
+                raise KeyError(f"active scheduled event not owned by caller: {event_id}")
             row = db.execute(
                 "SELECT * FROM scheduled_events WHERE event_id=?", (event_id,)
             ).fetchone()
@@ -388,27 +417,35 @@ class SQLiteSimulationStore:
             ).fetchone()
         return self._scheduled_from_row(row)
 
-    def mark_processed(self, event_id: str) -> None:
+    def mark_processed(self, event_id: str, *, claim_token: str | None = None) -> None:
         with self._connect() as db:
-            cursor = db.execute(
-                "UPDATE scheduled_events SET status='PROCESSED',last_error=NULL,"
-                "next_attempt_at=NULL,claim_token=NULL,claimed_at=NULL "
-                "WHERE event_id=? AND status IN ('PENDING','RETRY','CLAIMED')",
-                (event_id,),
-            )
+            if claim_token is None:
+                cursor = db.execute(
+                    "UPDATE scheduled_events SET status='PROCESSED',last_error=NULL,"
+                    "next_attempt_at=NULL,claim_token=NULL,claimed_at=NULL "
+                    "WHERE event_id=? AND status IN ('PENDING','RETRY')",
+                    (event_id,),
+                )
+            else:
+                cursor = db.execute(
+                    "UPDATE scheduled_events SET status='PROCESSED',last_error=NULL,"
+                    "next_attempt_at=NULL,claim_token=NULL,claimed_at=NULL "
+                    "WHERE event_id=? AND status='CLAIMED' AND claim_token=?",
+                    (event_id, claim_token),
+                )
             if cursor.rowcount != 1:
-                raise KeyError(f"active scheduled event not found: {event_id}")
+                raise KeyError(f"active scheduled event not owned by caller: {event_id}")
 
-    def complete_claimed_event(self, event_id: str) -> None:
+    def complete_claimed_event(self, event_id: str, *, claim_token: str) -> None:
         with self._connect() as db:
             cursor = db.execute(
                 "UPDATE scheduled_events SET status='PROCESSED',last_error=NULL,"
                 "next_attempt_at=NULL,claim_token=NULL,claimed_at=NULL "
-                "WHERE event_id=? AND status='CLAIMED'",
-                (event_id,),
+                "WHERE event_id=? AND status='CLAIMED' AND claim_token=?",
+                (event_id, claim_token),
             )
             if cursor.rowcount != 1:
-                raise KeyError(f"claimed event not found: {event_id}")
+                raise KeyError(f"claimed event not owned by caller: {event_id}")
 
     def append_simulation_messages(
         self,
@@ -448,6 +485,7 @@ class SQLiteSimulationStore:
         self,
         *,
         event_id: str,
+        claim_token: str,
         twin_person_id: str,
         platform: str,
         conversation_id: str,
@@ -455,17 +493,22 @@ class SQLiteSimulationStore:
         messages: Iterable[tuple[datetime, str]],
         metadata: dict[str, object] | None = None,
     ) -> None:
-        """Insert generated output and mark the claimed event processed atomically."""
+        """Insert generated output and complete the exact owned claim atomically."""
 
         rows = list(messages)
         encoded_metadata = json.dumps(metadata or {}, ensure_ascii=False)
         with self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
             state = db.execute(
-                "SELECT status FROM scheduled_events WHERE event_id=?", (event_id,)
+                "SELECT status,claim_token FROM scheduled_events WHERE event_id=?",
+                (event_id,),
             ).fetchone()
-            if state is None or state["status"] != "CLAIMED":
-                raise KeyError(f"claimed event not found: {event_id}")
+            if (
+                state is None
+                or state["status"] != "CLAIMED"
+                or state["claim_token"] != claim_token
+            ):
+                raise KeyError(f"claimed event not owned by caller: {event_id}")
             if rows:
                 db.executemany(
                     "INSERT INTO simulation_messages("
@@ -488,11 +531,98 @@ class SQLiteSimulationStore:
             cursor = db.execute(
                 "UPDATE scheduled_events SET status='PROCESSED',last_error=NULL,"
                 "next_attempt_at=NULL,claim_token=NULL,claimed_at=NULL "
-                "WHERE event_id=? AND status='CLAIMED'",
-                (event_id,),
+                "WHERE event_id=? AND status='CLAIMED' AND claim_token=?",
+                (event_id, claim_token),
             )
             if cursor.rowcount != 1:
                 raise RuntimeError("event claim changed during atomic completion")
+
+    @staticmethod
+    def _mark_messages_read_in_db(
+        db: sqlite3.Connection,
+        *,
+        twin_person_id: str,
+        platform: str,
+        conversation_id: str,
+        sender_person_id: str,
+        read_at: datetime,
+        sent_before_or_at: datetime | None,
+        source: str,
+    ) -> int:
+        cutoff = sent_before_or_at or read_at
+        rows = db.execute(
+            "SELECT id,metadata_json FROM simulation_messages "
+            "WHERE twin_person_id=? AND platform=? AND conversation_id=? "
+            "AND sender_person_id=? AND timestamp<=? ORDER BY timestamp,id",
+            (
+                twin_person_id,
+                platform,
+                conversation_id,
+                sender_person_id,
+                cutoff.isoformat(),
+            ),
+        ).fetchall()
+        updates: list[tuple[str, int]] = []
+        for row in rows:
+            metadata = json.loads(row["metadata_json"] or "{}")
+            if metadata.get("read_at"):
+                continue
+            metadata["read_at"] = read_at.isoformat()
+            metadata["read_status"] = "READ"
+            metadata["read_receipt_source"] = source
+            updates.append((json.dumps(metadata, ensure_ascii=False), int(row["id"])))
+        if updates:
+            db.executemany(
+                "UPDATE simulation_messages SET metadata_json=? WHERE id=?", updates
+            )
+        return len(updates)
+
+    def complete_claimed_read_event(
+        self,
+        *,
+        event_id: str,
+        claim_token: str,
+        twin_person_id: str,
+        platform: str,
+        conversation_id: str,
+        sender_person_id: str,
+        read_at: datetime,
+        sent_before_or_at: datetime | None = None,
+        source: str = "SIMULATION_LATENT_READ",
+    ) -> int:
+        """Apply latent READ state and complete the exact claim atomically."""
+
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            state = db.execute(
+                "SELECT status,claim_token FROM scheduled_events WHERE event_id=?",
+                (event_id,),
+            ).fetchone()
+            if (
+                state is None
+                or state["status"] != "CLAIMED"
+                or state["claim_token"] != claim_token
+            ):
+                raise KeyError(f"claimed read event not owned by caller: {event_id}")
+            updated = self._mark_messages_read_in_db(
+                db,
+                twin_person_id=twin_person_id,
+                platform=platform,
+                conversation_id=conversation_id,
+                sender_person_id=sender_person_id,
+                read_at=read_at,
+                sent_before_or_at=sent_before_or_at,
+                source=source,
+            )
+            cursor = db.execute(
+                "UPDATE scheduled_events SET status='PROCESSED',last_error=NULL,"
+                "next_attempt_at=NULL,claim_token=NULL,claimed_at=NULL "
+                "WHERE event_id=? AND status='CLAIMED' AND claim_token=?",
+                (event_id, claim_token),
+            )
+            if cursor.rowcount != 1:
+                raise RuntimeError("read event claim changed during atomic completion")
+            return updated
 
     def mark_messages_read(
         self,
@@ -505,34 +635,17 @@ class SQLiteSimulationStore:
         sent_before_or_at: datetime | None = None,
         source: str = "SIMULATION_LATENT_READ",
     ) -> int:
-        cutoff = sent_before_or_at or read_at
         with self._connect() as db:
-            rows = db.execute(
-                "SELECT id,metadata_json FROM simulation_messages "
-                "WHERE twin_person_id=? AND platform=? AND conversation_id=? "
-                "AND sender_person_id=? AND timestamp<=? ORDER BY timestamp,id",
-                (
-                    twin_person_id,
-                    platform,
-                    conversation_id,
-                    sender_person_id,
-                    cutoff.isoformat(),
-                ),
-            ).fetchall()
-            updates: list[tuple[str, int]] = []
-            for row in rows:
-                metadata = json.loads(row["metadata_json"] or "{}")
-                if metadata.get("read_at"):
-                    continue
-                metadata["read_at"] = read_at.isoformat()
-                metadata["read_status"] = "READ"
-                metadata["read_receipt_source"] = source
-                updates.append((json.dumps(metadata, ensure_ascii=False), int(row["id"])))
-            if updates:
-                db.executemany(
-                    "UPDATE simulation_messages SET metadata_json=? WHERE id=?", updates
-                )
-        return len(updates)
+            return self._mark_messages_read_in_db(
+                db,
+                twin_person_id=twin_person_id,
+                platform=platform,
+                conversation_id=conversation_id,
+                sender_person_id=sender_person_id,
+                read_at=read_at,
+                sent_before_or_at=sent_before_or_at,
+                source=source,
+            )
 
     def backfill_read_receipts(
         self,

@@ -5,6 +5,7 @@ from backend.fusion import EvidenceContext, EvidenceMessage
 from backend.live_timing import (
     BurstGapSampler,
     ContextualLiveTimingSampler,
+    TimingSampleKind,
     classify_message_kind,
     visible_timing_features,
 )
@@ -205,6 +206,22 @@ def test_action_validity_gate_rejects_semantically_impossible_role() -> None:
 
     after_user = (_evidence(now, "self", "야"),)
     after_target = (_evidence(now, "target", "ㅇㅇ"),)
+    invalid_follow = sampler.sample_timing(
+        platform="kakao",
+        conversation_id="c",
+        action=Action.FOLLOW_UP,
+        observed_at=now,
+        visible_context=after_user,
+    )
+    invalid_reply = sampler.sample_timing(
+        platform="kakao",
+        conversation_id="c",
+        action=Action.REPLY,
+        observed_at=now,
+        visible_context=after_target,
+    )
+    assert invalid_follow.kind == TimingSampleKind.INVALID
+    assert invalid_reply.kind == TimingSampleKind.INVALID
     assert sampler.sample_delay_seconds(
         platform="kakao",
         conversation_id="c",
@@ -250,3 +267,88 @@ def test_burst_gap_sampler_uses_observed_internal_gaps_instead_of_fixed_one_seco
     case = replace(case, target_burst=(first, second), burst_size=2)
     sampler = BurstGapSampler([case], seed=1)
     assert sampler.sample_gaps(conversation_id="c", count=2) == (7.0,)
+
+
+class _TinyReplyHazard:
+    """Only ten percent total event mass, all in the first bin."""
+
+    def hazard_probability(self, case, *, elapsed_seconds):
+        return 0.1 if elapsed_seconds == 0.0 else 0.0
+
+
+def test_live_hazard_is_conditioned_on_already_selected_reply_event() -> None:
+    case = _case("reply", datetime(2026, 8, 3, 8, 0), 42.0)
+    sampler = ContextualLiveTimingSampler([case], person_id="target", seed=7)
+    sampler._hazard = _TinyReplyHazard()  # force the richer path for this regression
+    now = datetime(2026, 8, 10, 12, 0)
+    context = (_evidence(now, "self", "질문"),)
+
+    # Pre-v1.2.1 hazard sampling could return None from residual survival mass,
+    # silently turning timing into a second REPLY-vs-WAIT policy. Once behavior
+    # already selected REPLY, live timing must condition on event occurrence.
+    for _ in range(20):
+        sampled = sampler.sample_timing(
+            platform="kakao",
+            conversation_id="c",
+            action=Action.REPLY,
+            observed_at=now,
+            visible_context=context,
+        )
+        assert sampled.kind == TimingSampleKind.SAMPLED
+        assert sampled.delay_seconds is not None
+        assert 0.0 <= sampled.delay_seconds <= 60.0
+
+
+class _ImpossibleEarlyHazard:
+    def hazard_probability(self, case, *, elapsed_seconds):
+        return 1.0 if elapsed_seconds == 0.0 else 0.0
+
+
+def test_initiate_timing_never_uses_early_hazard_mass() -> None:
+    observation = datetime(2026, 8, 3, 8, 0)
+    case = _case(
+        "initiate",
+        observation,
+        8 * 3600.0,
+        action=Action.INITIATE,
+    )
+    sampler = ContextualLiveTimingSampler([case], person_id="target", seed=9)
+    sampler._hazard = _ImpossibleEarlyHazard()
+    now = datetime(2026, 8, 10, 12, 0)
+    context = (_evidence(now, "target", "마지막 상대 메시지"),)
+
+    sampled = sampler.sample_timing(
+        platform="kakao",
+        conversation_id="c",
+        action=Action.INITIATE,
+        observed_at=now,
+        visible_context=context,
+    )
+    assert sampled.kind == TimingSampleKind.SAMPLED
+    assert sampled.delay_seconds is not None
+    assert sampled.delay_seconds > 6 * 3600.0
+
+
+def test_follow_up_timing_never_crosses_new_session_boundary() -> None:
+    observation = datetime(2026, 8, 3, 8, 0)
+    case = _case(
+        "follow",
+        observation,
+        2 * 3600.0,
+        action=Action.FOLLOW_UP,
+    )
+    sampler = ContextualLiveTimingSampler([case], person_id="target", seed=10)
+    sampler._hazard = _ImpossibleEarlyHazard()
+    now = datetime(2026, 8, 10, 12, 0)
+    context = (_evidence(now, "target", "마지막 상대 메시지"),)
+
+    sampled = sampler.sample_timing(
+        platform="kakao",
+        conversation_id="c",
+        action=Action.FOLLOW_UP,
+        observed_at=now,
+        visible_context=context,
+    )
+    assert sampled.kind == TimingSampleKind.SAMPLED
+    assert sampled.delay_seconds is not None
+    assert sampled.delay_seconds <= 6 * 3600.0
